@@ -1,0 +1,88 @@
+name: Nodalong
+options:
+  bundleIdPrefix: com.bigdeccyh
+  deploymentTarget:
+    iOS: "26.1"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.1"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    SWIFT_STRICT_CONCURRENCY: complete
+
+packages:
+  Firebase:
+    url: https://github.com/firebase/firebase-ios-sdk
+    from: 11.0.0
+  NodalongKit:
+    path: NodalongKit
+  Kingfisher:
+    url: https://github.com/onevcat/Kingfisher
+    from: 8.0.0
+
+targets:
+  Nodalong:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: Nodalong
+        excludes:
+          - "**/.gitkeep"
+    resources:
+      - Nodalong/Resources/Assets.xcassets
+      - Nodalong/Resources/LaunchScreen.storyboard
+      - Nodalong/Resources/Fonts
+      - path: Nodalong/GoogleService-Info.plist
+        optional: true
+    info:
+      path: Nodalong/Info.plist
+      properties:
+        CFBundleDisplayName: Nodalong
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "1"
+        UILaunchStoryboardName: LaunchScreen
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIBackgroundModes:
+          - audio
+        NSLocationWhenInUseUsageDescription: Nodalong uses your approximate location to show music listeners near you.
+        NSPhotoLibraryUsageDescription: Nodalong needs access to your photo library so you can choose a profile picture.
+        NSAppleMusicUsageDescription: Nodalong uses Apple Music to play tracks and access your library.
+        UIAppFonts:
+          - Quicksand-Light.ttf
+          - Quicksand-Regular.ttf
+          - Quicksand-Medium.ttf
+          - Quicksand-SemiBold.ttf
+          - Quicksand-Bold.ttf
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - com.bigdeccyh.nodalong
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bigdeccyh.nodalong
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_PREVIEWS: YES
+        DEVELOPMENT_TEAM: BZWD55RJD7
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: Firebase
+        product: FirebaseAuth
+      - package: Firebase
+        product: FirebaseFirestore
+      - package: Firebase
+        product: FirebaseStorage
+      - package: Firebase
+        product: FirebaseDatabase
+      - package: NodalongKit
+        product: NodalongKit
+      - package: Kingfisher
+        product: Kingfisher

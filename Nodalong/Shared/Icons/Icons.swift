@@ -1,0 +1,35 @@
+import SwiftUI
+
+// SF Symbol names mapped from every Ionicons name used in the JS codebase.
+// Usage: Image(systemName: Icons.heart)
+enum Icons {
+    static let arrowBack          = "arrow.backward"
+    static let checkmark          = "checkmark"
+    static let checkmarkCircle    = "checkmark.circle"
+    static let chevronDown        = "chevron.down"
+    static let chevronForward     = "chevron.right"
+    static let close              = "xmark"
+    static let closeCircle        = "xmark.circle.fill"
+    static let discOutline        = "opticaldisc"
+    static let discSharp          = "opticaldisc.fill"
+    static let bookmark           = "bookmark"
+    static let bookmarkFill       = "bookmark.fill"
+    static let heart              = "heart.fill"
+    static let heartOutline       = "heart"
+    static let logOutOutline      = "rectangle.portrait.and.arrow.right"
+    static let mapOutline         = "map"
+    static let moreActions        = "ellipsis"
+    static let musicalNote        = "music.note"
+    static let musicalNotesOutline = "music.note.list"
+    static let musicalNotesSharp  = "music.note.list"
+    static let pencilOutline      = "pencil"
+    static let person             = "person.fill"
+    static let personOutline      = "person"
+    static let play               = "play.fill"
+    static let queue              = "list.bullet"
+    static let addToQueue         = "text.badge.plus"
+    static let search             = "magnifyingglass"
+    static let searchOutline      = "magnifyingglass"
+    static let settingsOutline    = "gearshape"
+    static let star               = "star.fill"
+}

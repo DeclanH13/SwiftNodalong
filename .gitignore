@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+
+# Xcode (generated project)
+Nodalong.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+
+# Build
+build/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# SwiftPM
+.swiftpm/
+.build/
+Package.resolved
+
+# Secrets — must NOT be committed (downloaded per-developer from Firebase console).
+# Glob, not the exact filename: browsers name duplicate downloads
+# "GoogleService-Info 2.plist" / "GoogleService-Info(1).plist", which an exact
+# path does NOT match — three such copies were found staged with live API keys
+# in them while setting up this remote.
+Nodalong/GoogleService-Info*.plist
+**/GoogleService-Info*.plist
+
+# Other credential shapes, none currently present — here so they can't be
+# added by accident later.
+*.p8
+*.p12
+*.pem
+*.mobileprovision
+.env
+.env.*
+service-account*.json

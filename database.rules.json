@@ -1,0 +1,34 @@
+{
+  "rules": {
+    "parties_live": {
+      "$partyId": {
+        ".read": "auth != null",
+
+        ".write": "auth != null && (!data.child('hostUid').exists() || data.child('hostUid').val() == auth.uid)",
+
+        "hostUid": {
+          ".write": "auth != null && newData.val() == auth.uid && (!data.exists() || data.val() == auth.uid)"
+        },
+
+        "presence": {
+          "$uid": {
+            ".write": "auth != null && auth.uid == $uid"
+          }
+        },
+
+        "nowPlaying": {
+          ".write": "auth != null && root.child('parties_live').child($partyId).child('hostUid').val() == auth.uid"
+        }
+      }
+    },
+
+    "users_live": {
+      "$uid": {
+        ".read": "auth != null",
+        "nowPlaying": {
+          ".write": "auth != null && auth.uid == $uid"
+        }
+      }
+    }
+  }
+}

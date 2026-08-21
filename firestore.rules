@@ -1,0 +1,89 @@
+rules_version = '2';
+
+// Nodalong Firestore security rules.
+//
+// IMPORTANT: deploying this file REPLACES all Firestore rules, so it must cover
+// EVERY collection the app uses. This is the app's first multi-writer surface
+// (listening parties) — before parties/playlists, every doc was written only by
+// its owner under their own uid.
+//
+// v1 notes / known relaxations (harden later):
+//  - Playlist reads are allowed for any signed-in user; `visibility` is enforced
+//    client-side. Gating reads by visibility in rules breaks the
+//    `contributorUids array-contains` queries (Firestore fails the whole query
+//    if any matched doc is unreadable), so that's deferred.
+//  - The shared `tracks` catalog and `nod_records` are writable by any signed-in
+//    user (every ingestion path upserts the catalog; nods are low-risk).
+//
+// Review in the Firebase console Rules Playground before deploying.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function party(pid) { return get(/databases/$(database)/documents/parties/$(pid)).data; }
+    function playlist(plid) { return get(/databases/$(database)/documents/playlists/$(plid)).data; }
+
+    // Shared, ISRC-keyed catalog — read + upsert by any signed-in user.
+    match /tracks/{catalogId} {
+      allow read, write: if signedIn();
+    }
+
+    // ISRC -> catalogId dedup index used by upsertCatalogTrack's transaction.
+    // Same trust level as `tracks` itself (every ingestion path can upsert it).
+    match /isrc_index/{indexId} {
+      allow read, write: if signedIn();
+    }
+
+    // Nod dedup records.
+    match /nod_records/{recordId} {
+      allow read, write: if signedIn();
+    }
+
+    // User profiles + owner-private subcollections.
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow write: if signedIn() && uid() == userId;
+
+      match /recent_tracks/{trackId}   { allow read: if signedIn(); allow write: if signedIn() && uid() == userId; }
+      match /library/{trackId}         { allow read: if signedIn(); allow write: if signedIn() && uid() == userId; }
+      match /spotlight_history/{docId} { allow read: if signedIn(); allow write: if signedIn() && uid() == userId; }
+
+      // Owner manages their own "following"; a "followers/{followerId}" entry is
+      // writable only by that follower (the follow op writes into the target).
+      match /following/{followedId} { allow read: if signedIn(); allow write: if signedIn() && uid() == userId; }
+      match /followers/{followerId} { allow read: if signedIn(); allow write: if signedIn() && uid() == followerId; }
+    }
+
+    // Playlists — only the owner mutates; owner also owns the tracks subcollection
+    // (add-to-playlist always targets one of the caller's own playlists; the
+    // party-freeze writes as the host, who owns the result playlist).
+    match /playlists/{playlistId} {
+      allow read:          if signedIn();
+      allow create:        if signedIn() && uid() == request.resource.data.ownerUid;
+      allow update, delete: if signedIn() && uid() == resource.data.ownerUid;
+
+      match /tracks/{trackId} {
+        allow read:  if signedIn();
+        allow write: if signedIn() && uid() == playlist(playlistId).ownerUid;
+      }
+    }
+
+    // Listening parties — host owns the party doc; queue writes are gated by the
+    // party's permission + live status; play/remove is host-only.
+    match /parties/{partyId} {
+      allow read:           if signedIn();
+      allow create:         if signedIn() && uid() == request.resource.data.hostUid;
+      allow update, delete: if signedIn() && uid() == resource.data.hostUid;
+
+      match /queue/{trackId} {
+        allow read: if signedIn();
+        allow create: if signedIn()
+          && party(partyId).status == 'live'
+          && (uid() == party(partyId).hostUid || party(partyId).permission == 'anyone');
+        allow update, delete: if signedIn() && uid() == party(partyId).hostUid;
+      }
+    }
+  }
+}
