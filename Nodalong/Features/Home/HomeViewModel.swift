@@ -204,7 +204,7 @@ final class HomeViewModel: ObservableObject {
             set(\.recommendationShelves, try await musicService.getPersonalRecommendations(maxGroups: 5))
             set(\.madeForYouPlaylists, try await musicService.getMadeForYouPlaylists(maxGroups: 5))
         } catch {
-            print("[Nodalong.Home] personalized recommendations failed: \(error)")
+            debugLog("[Nodalong.Home] personalized recommendations failed: \(error)")
         }
     }
 

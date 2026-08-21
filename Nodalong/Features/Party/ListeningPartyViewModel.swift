@@ -143,7 +143,7 @@ final class ListeningPartyViewModel: ObservableObject {
                 do {
                     try await seedPartyQueue(partyId: id, songs: songs, hostUid: me.uid, hostUsername: me.username)
                 } catch {
-                    print("[Nodalong.Party] seedPartyQueue failed for party \(id): \(error)")
+                    debugLog("[Nodalong.Party] seedPartyQueue failed for party \(id): \(error)")
                 }
             }
             if let party = try await getParty(id: id) {
@@ -402,7 +402,7 @@ final class ListeningPartyViewModel: ObservableObject {
             playlistId = try await endParty(party)
         } catch {
             errorMessage = "Couldn't save the LP playlist."
-            print("[Nodalong.Party] endParty failed: \(error)")
+            debugLog("[Nodalong.Party] endParty failed: \(error)")
         }
         // The party is over — detach listeners + presence + clear live state, but
         // keep `party` and set `endedPlaylist` so the summary can render.

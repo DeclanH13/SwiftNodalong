@@ -40,6 +40,18 @@ struct CachedArtworkImage<Placeholder: View, Failure: View>: View {
     @State private var image: UIImage?
     @State private var lowResImage: UIImage?
     @State private var didFail = false
+    /// Which URL `image` actually belongs to.
+    ///
+    /// Load-bearing. `@State` survives a view UPDATE — SwiftUI only uses
+    /// `init`'s `State(initialValue:)` the first time a view identity is
+    /// created, never on subsequent updates. So when this view is reused with
+    /// a new `urlString` (the full-screen player is one long-lived view whose
+    /// URL changes in place on every track change), `image` still holds the
+    /// PREVIOUS track's bitmap. Without this, `load()`'s `image != nil`
+    /// short-circuit saw that stale bitmap and returned immediately — the
+    /// new artwork never loaded, so the player showed the previous track's
+    /// cover while title/artist/album updated correctly.
+    @State private var loadedURLString: String?
 
     init(
         urlString: String,
@@ -52,7 +64,9 @@ struct CachedArtworkImage<Placeholder: View, Failure: View>: View {
         self.placeholder = placeholder
         self.failure = failure
         // Synchronous — a hit means zero placeholder frames. See (1) above.
-        _image = State(initialValue: ArtworkMemoryCache.image(for: urlString))
+        let initial = ArtworkMemoryCache.image(for: urlString)
+        _image = State(initialValue: initial)
+        _loadedURLString = State(initialValue: initial == nil ? nil : urlString)
         _lowResImage = State(initialValue: lowResURLString.flatMap { ArtworkMemoryCache.image(for: $0) })
     }
 
@@ -81,12 +95,29 @@ struct CachedArtworkImage<Placeholder: View, Failure: View>: View {
     }
 
     private func load() async {
+        // Reused for a DIFFERENT url: whatever is in `image` belongs to the
+        // previous one, so it must not be trusted or shown. See
+        // `loadedURLString`.
+        if loadedURLString != urlString {
+            didFail = false
+            lowResImage = lowResURLString.flatMap { ArtworkMemoryCache.image(for: $0) }
+            if let hit = ArtworkMemoryCache.image(for: urlString) {
+                image = hit
+                loadedURLString = urlString
+                return
+            }
+            // Nothing cached for the new url — drop the stale bitmap so the
+            // placeholder shows rather than the WRONG artwork.
+            image = nil
+        }
+
         // Already satisfied by the synchronous `init` read (or a previous
         // run of this task for the same URL).
         if image != nil { return }
 
         if let hit = ArtworkMemoryCache.image(for: urlString) {
             image = hit
+            loadedURLString = urlString
             return
         }
         guard let url = URL(string: urlString) else {
@@ -106,5 +137,6 @@ struct CachedArtworkImage<Placeholder: View, Failure: View>: View {
         guard !Task.isCancelled else { return }
         ArtworkMemoryCache.store(decoded, for: urlString)
         image = decoded
+        loadedURLString = urlString
     }
 }

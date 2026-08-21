@@ -274,20 +274,37 @@ struct UserProfileView: View {
     /// follower count, recent listens, full spotlight history.
     private func loadData() async {
         guard let myUid = authVM.currentUser?.uid else { return }
-        async let followCheck = isFollowing(myUid: myUid, targetUid: user.uid)
-        async let countFetch  = getFollowerCount(uid: user.uid)
-        async let tracksFetch = getYourMusicFeed(uid: user.uid)
-        async let historyFetch = getSpotlightHistory(uid: user.uid)
-        async let playlistsFetch = getUserPlaylists(uid: user.uid)
 
-        following        = (try? await followCheck)  ?? false
-        followerCount    = (try? await countFetch)   ?? 0
-        recentTracks     = (try? await tracksFetch)  ?? []
-        spotlightHistory = (try? await historyFetch) ?? []
-        // Only surface playlists this viewer may see. Without security rules
-        // yet, hide private ones client-side; friends/public are shown.
-        playlists        = ((try? await playlistsFetch) ?? []).filter { $0.visibility != .private }
-        activeSpotlights = await enrichSpotlights(user.spotlightTracks)
+        // Warm read first — usually already populated by browse-time prefetch
+        // from wherever the user arrived (Search results, NearMe, a follow
+        // list). Identity (avatar/username/bio) was already instant because
+        // the pushed `UserProfile` carries it; this is what used to arrive
+        // late and make the spotlight carousel and recents rail pop in.
+        if let warm = await SocialCache.shared.cachedBundle(uid: user.uid) {
+            apply(warm)
+        }
+
+        // Independent of the bundle — runs concurrently with it.
+        async let spotlights = enrichSpotlights(user.spotlightTracks)
+
+        // Cold miss fetches; an in-flight prefetch is JOINED, not duplicated.
+        apply(await SocialCache.shared.bundle(uid: user.uid, viewerUid: myUid))
+        activeSpotlights = await spotlights
+
+        // Their follower/following list is one tap from here.
+        SocialCache.shared.prefetchFollowLists(uid: user.uid)
+    }
+
+    /// Guarded assignments — SwiftUI re-renders on every `@State` write even
+    /// when the value is identical, which is what makes a refresh visible on
+    /// a revisit where nothing actually changed. Same convention as
+    /// `ProfileView.refresh()`.
+    private func apply(_ b: ProfileBundle) {
+        if following        != b.isFollowing      { following        = b.isFollowing }
+        if followerCount    != b.followerCount    { followerCount    = b.followerCount }
+        if recentTracks     != b.recentTracks     { recentTracks     = b.recentTracks }
+        if spotlightHistory != b.spotlightHistory { spotlightHistory = b.spotlightHistory }
+        if playlists        != b.playlists        { playlists        = b.playlists }
     }
 }
 

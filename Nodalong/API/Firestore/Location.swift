@@ -40,6 +40,10 @@ func getNearbyUsers(geohash: String, excludeUid: String, radiusKm: Double = 10.0
         }
         for try await docs in group { allDocs += docs }
     }
+    // Permanent early warning for the "no listeners nearby" bug class:
+    // separates "nobody has a geohash in these cells" from "found candidates
+    // but the distance filter rejected them". Cheap — one line per load.
+    diagLog("NearMe.query: own=\(geohash) prefixLen=\(prefixLen) cells=\(allCells) rawDocs=\(allDocs.count)")
 
     // Deduplicate, filter by Haversine distance, sort nearest first.
     var seen    = Set<String>()
@@ -57,8 +61,14 @@ func getNearbyUsers(geohash: String, excludeUid: String, radiusKm: Double = 10.0
         if data["createdAt"]       == nil  { data["createdAt"] = 0.0 }
         if data["updatedAt"]       == nil  { data["updatedAt"] = 0.0 }
 
-        guard let profile     = try? Firestore.Decoder().decode(UserProfile.self, from: data),
-              let userGeohash = data["geohash"] as? String else { continue }
+        guard let profile = try? Firestore.Decoder().decode(UserProfile.self, from: data) else {
+            diagLog("NearMe.skip: \(doc.documentID) failed to decode as UserProfile")
+            continue
+        }
+        guard let userGeohash = data["geohash"] as? String else {
+            diagLog("NearMe.skip: \(profile.username) has NO geohash field")
+            continue
+        }
 
         let (userLat, userLng) = decodeGeohash(userGeohash)
         let distance = haversineDistance(lat1: ownLat, lng1: ownLng, lat2: userLat, lng2: userLng)

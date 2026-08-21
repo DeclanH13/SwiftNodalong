@@ -109,7 +109,7 @@ func endParty(_ party: ListeningParty) async throws -> String? {
         let queue = try await getPartyQueueOnce(partyId: party.id, enrich: true)
         playlistId = try await freezePlaylist(from: party, queue: queue)
     } catch {
-        print("[Nodalong.Party] freeze failed for party \(party.id), ending without a playlist: \(error)")
+        debugLog("[Nodalong.Party] freeze failed for party \(party.id), ending without a playlist: \(error)")
     }
 
     try await partiesCollection.document(party.id).updateData([

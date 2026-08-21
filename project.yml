@@ -44,7 +44,7 @@ targets:
       properties:
         CFBundleDisplayName: Nodalong
         CFBundleShortVersionString: "0.1.1"
-        CFBundleVersion: "1"
+        CFBundleVersion: "4"
         UILaunchStoryboardName: LaunchScreen
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

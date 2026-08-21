@@ -172,6 +172,12 @@ final class FirebaseAuthViewModel {
         // this device (same or different account) must never render stale
         // content belonging to whoever was last signed in.
         if let uid = currentUser?.uid { SnapshotStore.clear(uid: uid) }
+        // Same reasoning, for the music-onboarding skip: it's an
+        // `@AppStorage` flag and therefore device-wide, not per-account, so
+        // without this a different person signing in on this device would
+        // silently inherit the previous user's "Not now" and never be offered
+        // onboarding at all.
+        UserDefaults.standard.removeObject(forKey: skippedMusicLinkKey)
         try? Auth.auth().signOut()
     }
 
@@ -181,6 +187,10 @@ final class FirebaseAuthViewModel {
 
     func refreshProfile() async {
         guard let uid = currentUser?.uid else { return }
+        // Spotlight add/remove and profile edits all funnel through here, so
+        // this is the one place that has to drop the own-profile bundle —
+        // otherwise a just-added spotlight wouldn't show on a revisit.
+        await SocialCache.shared.invalidate(uid: uid)
         await loadProfile(uid: uid)
     }
 

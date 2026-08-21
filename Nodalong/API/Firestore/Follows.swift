@@ -31,6 +31,12 @@ func followUser(myUid: String, myUsername: String, targetUid: String, targetUser
     // is guaranteed to be picked up by the next Home/Feed load regardless of
     // which screen triggered it.
     await FollowingCache.shared.invalidate()
+    // Both parties: the target's follower count and `isFollowing` change,
+    // and BOTH users' follower/following lists do. Done here at the API
+    // layer rather than at each call site so a follow toggle from anywhere
+    // in the app can't leave a stale count or button state behind.
+    await SocialCache.shared.invalidate(uid: myUid)
+    await SocialCache.shared.invalidate(uid: targetUid)
 }
 
 /// Atomically removes from both users' subcollections.
@@ -40,6 +46,12 @@ func unfollowUser(myUid: String, targetUid: String) async throws {
     batch.deleteDocument(followersRef(uid: targetUid).document(myUid))
     try await batch.commit()
     await FollowingCache.shared.invalidate()
+    // Both parties: the target's follower count and `isFollowing` change,
+    // and BOTH users' follower/following lists do. Done here at the API
+    // layer rather than at each call site so a follow toggle from anywhere
+    // in the app can't leave a stale count or button state behind.
+    await SocialCache.shared.invalidate(uid: myUid)
+    await SocialCache.shared.invalidate(uid: targetUid)
 }
 
 // MARK: - Queries

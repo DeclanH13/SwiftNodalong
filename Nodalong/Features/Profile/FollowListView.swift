@@ -54,7 +54,7 @@ struct FollowListView: View {
 
     var body: some View {
         List {
-            if isLoading {
+            if isLoading, profiles.isEmpty {
                 ProgressView()
                     .frame(maxWidth: .infinity)
                     .listRowBackground(Color.nodalong.bgCard)
@@ -110,27 +110,34 @@ struct FollowListView: View {
     }
 
     private func load() async {
-        isLoading = true
-        // Independent of the followers/following fetch below (only needs
-        // `myUid`, not `entries`) — hoisted into `async let` so it runs
-        // concurrently instead of after, cutting one round-trip off the total.
+        let myUid = authVM.currentUser?.uid ?? ""
+
+        // Warm-cache read first. `SocialCache` is populated by whichever
+        // profile screen the user tapped the follower/following count on —
+        // they're always one tap away from here, so by the time this runs the
+        // list is usually already resolved and there's no spinner at all.
+        if let warm = await SocialCache.shared.cachedFollowList(uid: uid, mode: mode) {
+            profiles  = warm
+            isLoading = false
+        }
+
+        // Independent of the list fetch (only needs `myUid`) — kept in
+        // `async let` so it still overlaps rather than running after.
         async let myFollowingResult: [(uid: String, username: String)] = {
-            guard let myUid = authVM.currentUser?.uid else { return [] }
+            guard !myUid.isEmpty else { return [] }
             return (try? await getFollowedEntries(uid: myUid)) ?? []
         }()
 
-        let entries = mode == .followers
-            ? (try? await getFollowersList(uid: uid)) ?? []
-            : (try? await getFollowingList(uid: uid)) ?? []
-        // Enrich the bare (uid, username) entries into full UserProfiles for
-        // avatar display + profile navigation; preserve the original order,
-        // dropping any uid whose profile fetch is missing (e.g. a deleted
-        // account) instead of showing a blank row.
-        let fetched = (try? await getUserProfiles(uids: entries.map(\.uid))) ?? []
-        let byUid = Dictionary(uniqueKeysWithValues: fetched.map { ($0.uid, $0) })
-        profiles = entries.compactMap { byUid[$0.uid] }
+        // Goes through the cache too: a cold miss fetches, and a concurrent
+        // in-flight warm is JOINED rather than duplicated.
+        let fresh = await SocialCache.shared.followList(uid: uid, mode: mode)
+        if fresh != profiles { profiles = fresh }
         followingUids = Set((await myFollowingResult).map { $0.uid })
         isLoading = false
+
+        // Tapping a name here is the most likely next action, so warm those
+        // profiles too — bounded, since each is ~5 billed Firestore reads.
+        SocialCache.shared.prefetch(uids: fresh.map(\.uid), viewerUid: myUid)
     }
 
     private func toggle(profile: UserProfile) {

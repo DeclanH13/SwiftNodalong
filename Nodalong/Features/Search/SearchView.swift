@@ -196,6 +196,20 @@ struct SearchView: View {
                 }
             }
         }
+
+        // Same browse-time prefetch, for PEOPLE. Warms the exact
+        // `SocialCache` bundle `UserProfileView` reads, so tapping a result
+        // lands on a complete profile — spotlight carousel and recents
+        // included — instead of watching five fetches arrive.
+        //
+        // Bounded to 6 like the music prefetch above, and that bound matters
+        // more here: each bundle is ~5 billed Firestore reads, where the
+        // music one hits Apple Music's API for free.
+        .task(id: searchVM.userResults.map(\.uid) + searchVM.suggestedUsers.map(\.uid)) {
+            guard let myUid = authVM.currentUser?.uid else { return }
+            SocialCache.shared.prefetch(uids: searchVM.userResults.map(\.uid), viewerUid: myUid)
+            SocialCache.shared.prefetch(uids: searchVM.suggestedUsers.map(\.uid), viewerUid: myUid)
+        }
     }
 
     // MARK: - Filter row

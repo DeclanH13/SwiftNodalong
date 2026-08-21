@@ -32,3 +32,8 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
 /// and `ProfileView` (writes, via the picker) stay in sync through the same
 /// `@AppStorage` binding.
 let appearanceModeKey = "nodalong.appearanceMode"
+
+/// `@AppStorage` key for "the user chose to skip music-service onboarding".
+/// Lives here beside `appearanceModeKey` so every persisted preference key is
+/// declared in one place. See `ContentView.skippedMusicLink`.
+let skippedMusicLinkKey = "nodalong.skippedMusicLink"

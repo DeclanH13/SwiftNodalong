@@ -201,7 +201,7 @@ final class SpotifyMusicService: ObservableObject, MusicService {
             let dto: SpotifyMeDTO = try await authenticatedRequest(path: "/me", decoding: SpotifyMeDTO.self)
             displayName = dto.displayName?.nonEmpty ?? dto.id.nonEmpty
         } catch {
-            print("[Nodalong.SpotifyMe] fetchDisplayName failed: \(error)")
+            debugLog("[Nodalong.SpotifyMe] fetchDisplayName failed: \(error)")
         }
     }
 
@@ -625,7 +625,7 @@ final class SpotifyMusicService: ObservableObject, MusicService {
             do {
                 return try await getTrack(id: song.trackId)
             } catch {
-                print("[Nodalong.SpotifyResolve] direct id lookup failed (\(song.trackId)): \(error)")
+                debugLog("[Nodalong.SpotifyResolve] direct id lookup failed (\(song.trackId)): \(error)")
                 lastRealError = error as? SpotifyServiceError
             }
         }
@@ -643,7 +643,7 @@ final class SpotifyMusicService: ObservableObject, MusicService {
                         do {
                             return try await getTrack(id: knownId)
                         } catch {
-                            print("[Nodalong.SpotifyResolve] catalog-known id lookup failed (\(knownId)): \(error)")
+                            debugLog("[Nodalong.SpotifyResolve] catalog-known id lookup failed (\(knownId)): \(error)")
                             lastRealError = error as? SpotifyServiceError
                         }
                     }
@@ -652,7 +652,7 @@ final class SpotifyMusicService: ObservableObject, MusicService {
                     }
                 }
             } catch {
-                print("[Nodalong.SpotifyResolve] catalog lookup failed (\(catalogId)): \(error)")
+                debugLog("[Nodalong.SpotifyResolve] catalog lookup failed (\(catalogId)): \(error)")
             }
         }
 
@@ -661,9 +661,9 @@ final class SpotifyMusicService: ObservableObject, MusicService {
                 if let result = try await searchByIsrc(isrc, preferAlbum: song.album), !result.trackId.isEmpty {
                     return try await getTrack(id: result.trackId)
                 }
-                print("[Nodalong.SpotifyResolve] ISRC search returned no match (\(isrc))")
+                debugLog("[Nodalong.SpotifyResolve] ISRC search returned no match (\(isrc))")
             } catch {
-                print("[Nodalong.SpotifyResolve] ISRC search failed (\(isrc)): \(error)")
+                debugLog("[Nodalong.SpotifyResolve] ISRC search failed (\(isrc)): \(error)")
                 lastRealError = error as? SpotifyServiceError
             }
         }
@@ -692,9 +692,9 @@ final class SpotifyMusicService: ObservableObject, MusicService {
                 if let result = try await searchByTitleArtist(title: candidate.title, artist: candidate.artist, preferAlbum: song.album), !result.trackId.isEmpty {
                     return try await getTrack(id: result.trackId)
                 }
-                print("[Nodalong.SpotifyResolve] text search returned no match ('\(candidate.title)' by '\(candidate.artist)')")
+                debugLog("[Nodalong.SpotifyResolve] text search returned no match ('\(candidate.title)' by '\(candidate.artist)')")
             } catch {
-                print("[Nodalong.SpotifyResolve] text search failed ('\(candidate.title)' by '\(candidate.artist)'): \(error)")
+                debugLog("[Nodalong.SpotifyResolve] text search failed ('\(candidate.title)' by '\(candidate.artist)'): \(error)")
                 lastRealError = error as? SpotifyServiceError
             }
         }

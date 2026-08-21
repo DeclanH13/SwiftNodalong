@@ -20,6 +20,8 @@ struct AddToQueueButton: View {
     /// Cards over artwork need a light glyph plus a shadow to stay legible;
     /// list rows on a solid surface don't.
     var overArtwork: Bool = false
+    /// Overrides the glyph colour — see `TrackActionsMenuButton.tint`.
+    var tint: Color? = nil
 
     @EnvironmentObject private var partyVM: ListeningPartyViewModel
 
@@ -41,9 +43,9 @@ struct AddToQueueButton: View {
                 .foregroundStyle(
                     routeToParty
                         ? Color.nodalong.purpleAccent
-                        : (overArtwork
+                        : (tint ?? (overArtwork
                             ? Color.nodalong.textOnAccent.opacity(0.85)
-                            : Color.nodalong.textSecondary)
+                            : Color.nodalong.textSecondary))
                 )
                 .shadow(color: .black.opacity(overArtwork ? 0.7 : 0), radius: 4, y: 1)
                 .frame(width: 32, height: 32)

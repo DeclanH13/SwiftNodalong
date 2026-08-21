@@ -607,7 +607,7 @@ final class PlayerViewModel: ObservableObject {
         } catch {
             // Couldn't even find the track in the Apple Music catalog — skip it
             // and try the next queued track rather than halting the session.
-            print("[Nodalong.Player] resolve(\(song.title) by \(song.artist)) failed: \(error)")
+            debugLog("[Nodalong.Player] resolve(\(song.title) by \(song.artist)) failed: \(error)")
             isPlaying = false
             lastPlaybackErrorDetail = "\(error)"
             await skipUnplayableAndAdvance(failedTitle: song.title, attempt: attempt)
@@ -649,12 +649,12 @@ final class PlayerViewModel: ObservableObject {
             // ApplicationMusicPlayer throws because the user isn't
             // subscribed. Logged so the user can confirm the cause via the
             // Xcode console when debugging.
-            print("[Nodalong.Player] ApplicationMusicPlayer.play(\(musicKitSong.title)) failed: \(error)")
+            debugLog("[Nodalong.Player] ApplicationMusicPlayer.play(\(musicKitSong.title)) failed: \(error)")
             do {
                 try await playPreview(of: musicKitSong)
             } catch {
                 // No preview assets either — skip this track and try the next.
-                print("[Nodalong.Player] playPreview(\(musicKitSong.title)) failed: \(error)")
+                debugLog("[Nodalong.Player] playPreview(\(musicKitSong.title)) failed: \(error)")
                 isPlaying = false
                 lastPlaybackErrorDetail = "\(error)"
                 await skipUnplayableAndAdvance(failedTitle: musicKitSong.title, attempt: attempt)
@@ -726,13 +726,13 @@ final class PlayerViewModel: ObservableObject {
         } catch let error as SpotifyServiceError where isNoActiveDevice(error) {
             // Every remaining track has the same problem — don't skip-and-advance
             // through the whole queue burning the same error each time.
-            print("[Nodalong.Player] Spotify play(\(song.title)) failed: no active device")
+            debugLog("[Nodalong.Player] Spotify play(\(song.title)) failed: no active device")
             isPlaying = false
             spotifyPlaybackError = error.errorDescription
             awaitingSpotifyDeviceRetry = true
             stopBackends()
         } catch {
-            print("[Nodalong.Player] Spotify play(\(song.title)) failed: \(error)")
+            debugLog("[Nodalong.Player] Spotify play(\(song.title)) failed: \(error)")
             isPlaying = false
             lastPlaybackErrorDetail = (error as? SpotifyServiceError)?.errorDescription ?? "\(error)"
             await skipUnplayableAndAdvance(failedTitle: song.title, attempt: attempt)
@@ -844,7 +844,7 @@ final class PlayerViewModel: ObservableObject {
                 spotifyQueuedNextUri = uri
                 spotifyQueuedNextItemId = next.id
             } catch {
-                print("[Nodalong.Player] syncSpotifyNativeQueue failed: \(error)")
+                debugLog("[Nodalong.Player] syncSpotifyNativeQueue failed: \(error)")
             }
         }
     }
@@ -884,7 +884,7 @@ final class PlayerViewModel: ObservableObject {
                     try await player.queue.insert(musicKitSong, position: .afterCurrentEntry)
                     mirroredNextItemId = nextItem.id
                 } catch {
-                    print("[Nodalong.Player] syncNativeQueueNeighbors (next) failed: \(error)")
+                    debugLog("[Nodalong.Player] syncNativeQueueNeighbors (next) failed: \(error)")
                 }
             } else {
                 mirroredNextItemId = nil
@@ -1278,7 +1278,7 @@ final class PlayerViewModel: ObservableObject {
                     isPlaying = true
                 }
             } catch {
-                print("[Nodalong.Player] Spotify togglePlayPause failed: \(error)")
+                debugLog("[Nodalong.Player] Spotify togglePlayPause failed: \(error)")
             }
             return
         }
@@ -1327,7 +1327,7 @@ final class PlayerViewModel: ObservableObject {
                     // track is still loaded — re-resolving and re-queuing
                     // from scratch via `playCurrent()` gives it a real
                     // second chance instead of silently staying paused.
-                    print("[Nodalong.Player] togglePlayPause resume failed: \(error)")
+                    debugLog("[Nodalong.Player] togglePlayPause resume failed: \(error)")
                     await playCurrent()
                 }
             }
@@ -1410,11 +1410,11 @@ final class PlayerViewModel: ObservableObject {
                     matching: \.id, equalTo: MusicItemID(song.uri)
                 )
                 if let hit = try await req.response().items.first {
-                    print("[Nodalong.Resolve] resolved '\(song.title)' via direct id (\(song.uri))")
+                    debugLog("[Nodalong.Resolve] resolved '\(song.title)' via direct id (\(song.uri))")
                     return hit
                 }
             } catch {
-                print("[Nodalong.Resolve] id lookup failed (\(song.uri)): \(error)")
+                debugLog("[Nodalong.Resolve] id lookup failed (\(song.uri)): \(error)")
             }
         }
 
@@ -1431,11 +1431,11 @@ final class PlayerViewModel: ObservableObject {
                 let items = try await req.response().items
                 if !items.isEmpty {
                     let idx = bestReleaseIndex(albumNames: items.map { $0.albumTitle ?? "" }, expectedAlbum: song.album) ?? 0
-                    print("[Nodalong.Resolve] resolved '\(song.title)' via ISRC (\(isrc))")
+                    debugLog("[Nodalong.Resolve] resolved '\(song.title)' via ISRC (\(isrc))")
                     return items[idx]
                 }
             } catch {
-                print("[Nodalong.Resolve] ISRC lookup failed (\(isrc)): \(error)")
+                debugLog("[Nodalong.Resolve] ISRC lookup failed (\(isrc)): \(error)")
             }
         }
 
@@ -1450,12 +1450,12 @@ final class PlayerViewModel: ObservableObject {
             let songs = try await search.response().songs
             if !songs.isEmpty {
                 let idx = bestReleaseIndex(albumNames: songs.map { $0.albumTitle ?? "" }, expectedAlbum: song.album) ?? 0
-                print("[Nodalong.Resolve] resolved '\(song.title)' via text search")
+                debugLog("[Nodalong.Resolve] resolved '\(song.title)' via text search")
                 return songs[idx]
             }
-            print("[Nodalong.Resolve] text search returned 0 results for '\(song.title) \(song.artist)'")
+            debugLog("[Nodalong.Resolve] text search returned 0 results for '\(song.title) \(song.artist)'")
         } catch {
-            print("[Nodalong.Resolve] text search failed: \(error)")
+            debugLog("[Nodalong.Resolve] text search failed: \(error)")
         }
 
         throw AppleMusicServiceError.trackNotFound
@@ -1724,7 +1724,7 @@ final class PlayerViewModel: ObservableObject {
             try AVAudioSession.sharedInstance().setActive(true)
             audioSessionActive = true
         } catch {
-            print("[Nodalong.Player] audio session activation failed: \(error)")
+            debugLog("[Nodalong.Player] audio session activation failed: \(error)")
         }
     }
 

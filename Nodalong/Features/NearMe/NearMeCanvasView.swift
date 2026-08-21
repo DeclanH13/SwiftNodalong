@@ -256,6 +256,10 @@ struct NearMeCanvasView: View {
         if !hasSpawned {
             spawnInitial(size)
             hasSpawned = true
+        } else if activePool.isEmpty, !users.isEmpty {
+            // Layout settled after the users arrived — `hasSpawned` is
+            // already true, so nothing else would ever fill the pool.
+            reconcileQueue()
         }
     }
 
@@ -297,10 +301,40 @@ struct NearMeCanvasView: View {
         }
 
         let activeSet = Set(activePool)
-        unusedQueue = users
+        var waiting = users
             .map { $0.uid }
             .filter { !activeSet.contains($0) }
             .shuffled()
+
+        // Promote straight into any FREE slot rather than only ever adding to
+        // the bench.
+        //
+        // This used to be unnecessary: the canvas was only ever constructed
+        // once `users` was already non-empty, so `spawnInitial` filled the
+        // pool and this function's job was purely arrivals/departures after
+        // that. The park now renders immediately with `users: []` (so there's
+        // no loading wheel), which means `spawnInitial` runs with nothing to
+        // spawn and every later arrival landed on the bench with no alive
+        // avatar to despawn and make room — an empty park even though the
+        // query had returned users. That was the "no listeners nearby" report.
+        //
+        // Correct beyond that case too: bumping the radius to reveal new
+        // users previously showed none of them until an existing avatar
+        // happened to die.
+        if canvasSize > 0 {
+            let aliveCount = activePool.filter { avatarStates[$0]?.lifecycle != .leaving }.count
+            var freeSlots  = max(0, poolCap - aliveCount)
+            while freeSlots > 0, !waiting.isEmpty {
+                let uid = waiting.removeFirst()
+                var state = AvatarAnimationState.spawning(canvasSize: canvasSize)
+                state.lifeRemaining = AvatarAnimationState.fadeDuration
+                avatarStates[uid] = state
+                activePool.append(uid)
+                freeSlots -= 1
+            }
+        }
+
+        unusedQueue = waiting
     }
 
     // MARK: - Timer lifecycle

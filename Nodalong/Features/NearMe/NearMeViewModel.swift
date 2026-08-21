@@ -20,7 +20,13 @@ final class NearMeViewModel: ObservableObject {
 
     /// Set once data has been loaded for the current session. Prevents
     /// redundant Firestore reads when `.task` re-fires on tab re-visit.
-    private var hasLoaded = false
+    ///
+    /// `@Published` so the view can tell "we've searched and found nobody"
+    /// apart from "we haven't searched yet" — without it, an empty
+    /// `nearbyUsers` before the first fetch is indistinguishable from a
+    /// genuine no-results, and the empty state claims "No listeners nearby"
+    /// while location is still resolving. That was a real regression.
+    @Published private(set) var hasLoaded = false
 
     /// Geohash that was used for the most recent successful load. If the
     /// user moves significantly (different geohash), a re-load is triggered
@@ -36,6 +42,10 @@ final class NearMeViewModel: ObservableObject {
         defer { isLoading = false }
         do {
             let users = try await getNearbyUsers(geohash: geohash, excludeUid: excludeUid, radiusKm: radiusKm)
+            // Facts, not theories, if "no listeners nearby" is ever reported
+            // again: this says whether the query actually ran and what it
+            // returned, rather than leaving an empty map ambiguous.
+            diagLog("NearMe.load: geohash=\(geohash) radius=\(Int(radiusKm))km -> \(users.count) users")
             nearbyUsers = users
             hasLoaded      = true
             loadedGeohash  = geohash

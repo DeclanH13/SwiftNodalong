@@ -311,7 +311,7 @@ final class SearchViewModel: ObservableObject {
                 )
             } catch {
                 if !Self.isCancellation(error) {
-                    print("[Nodalong.Search] searchAll('\(query)') failed: \(error)")
+                    debugLog("[Nodalong.Search] searchAll('\(query)') failed: \(error)")
                     lastSearchErrorDetail = Self.errorDetail(error)
                 }
                 return .empty
@@ -323,7 +323,7 @@ final class SearchViewModel: ObservableObject {
                 return CombinedSearchResults(artists: artists, albums: [], tracks: [])
             } catch {
                 if !Self.isCancellation(error) {
-                    print("[Nodalong.Search] searchArtists('\(query)') failed: \(error)")
+                    debugLog("[Nodalong.Search] searchArtists('\(query)') failed: \(error)")
                     lastSearchErrorDetail = Self.errorDetail(error)
                 }
                 return .empty
@@ -335,7 +335,7 @@ final class SearchViewModel: ObservableObject {
                 return CombinedSearchResults(artists: [], albums: albums, tracks: [])
             } catch {
                 if !Self.isCancellation(error) {
-                    print("[Nodalong.Search] searchAlbums('\(query)') failed: \(error)")
+                    debugLog("[Nodalong.Search] searchAlbums('\(query)') failed: \(error)")
                     lastSearchErrorDetail = Self.errorDetail(error)
                 }
                 return .empty
@@ -351,7 +351,7 @@ final class SearchViewModel: ObservableObject {
                 )
             } catch {
                 if !Self.isCancellation(error) {
-                    print("[Nodalong.Search] searchTracks('\(query)') failed: \(error)")
+                    debugLog("[Nodalong.Search] searchTracks('\(query)') failed: \(error)")
                     lastSearchErrorDetail = Self.errorDetail(error)
                 }
                 return .empty

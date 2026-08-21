@@ -31,8 +31,22 @@ struct ContentView: View {
     /// see that function's doc comment. No extra "is profile loaded" guard
     /// needed: `authVM.isInitializing` (gating `MainTabView` itself) already
     /// guarantees `authVM.profile` has been fetched by the time this is read.
+    /// Set once the user chooses "Not now" on the music-service onboarding.
+    ///
+    /// Without this the cover was an inescapable gate: `MusicServiceLinkView`
+    /// has a single button that `.disabled(...)`s itself once MusicKit
+    /// reports `.denied`, and the cover only dismisses when `activeService`
+    /// becomes non-nil. Anyone who tapped "Don't Allow" once — including an
+    /// App Review tester, or a tester with no Apple Music subscription — was
+    /// locked out of the app entirely, with only a "change it in Settings"
+    /// caption. Skipping leaves the app usable (browse, profiles, follows);
+    /// Profile → Music Services is the way back in to connect later.
+    @AppStorage(skippedMusicLinkKey) private var skippedMusicLink = false
+
     private var shouldShowMusicLink: Bool {
-        authVM.isAuthenticated && authVM.profile?.activeService == nil
+        authVM.isAuthenticated
+            && authVM.profile?.activeService == nil
+            && !skippedMusicLink
     }
 
     /// `true` for a brief guaranteed window right after sign-in/registration
@@ -109,7 +123,7 @@ struct ContentView: View {
             if showMusicLink != shouldShow { showMusicLink = shouldShow }
         }
         .fullScreenCover(isPresented: $showMusicLink) {
-            MusicServiceLinkView()
+            MusicServiceLinkView(onSkip: { skippedMusicLink = true })
                 .environmentObject(musicService)
                 .environmentObject(spotifyService)
                 .environment(authVM)
@@ -164,6 +178,19 @@ struct ContentView: View {
         .task {
             guard let uid = authVM.currentUser?.uid else { return }
             await endOrphanedLiveParties(hostUid: uid)
+        }
+        // Keep your OWN profile ready at all times.
+        //
+        // `ProfileView` already paints instantly from its disk
+        // `ProfileSnapshot`, but that snapshot only refreshes when Profile
+        // itself appears — so the FIRST visit of a session showed last
+        // session's data until the network caught up. Warming here means the
+        // bundle and both follow lists are resolved before you ever tap the
+        // avatar. Fire-and-forget: nothing on screen awaits it.
+        .task {
+            guard let uid = authVM.currentUser?.uid else { return }
+            SocialCache.shared.prefetch(uid: uid, viewerUid: uid)
+            SocialCache.shared.prefetchFollowLists(uid: uid)
         }
         // Spotify support is suspended (connect entry points removed) — an
         // account still linked from before this shipped would otherwise be

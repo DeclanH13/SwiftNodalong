@@ -99,23 +99,41 @@ struct TrackCard: View {
         }
     }
 
+    // MARK: - Spotlit row ink
+    //
+    // `.row` sits on the app's own `bgCard`, not on artwork, so when it turns
+    // to foil there is nothing dark behind the text — every label has to flip
+    // to ink or it disappears. `.fullBleed` needs no equivalent: its text sits
+    // on the black legibility scrim at the bottom of the card.
+
+    private var rowPrimaryInk: Color {
+        isSpotlit ? SpotlightFoil.ink : Color.nodalong.textPrimary
+    }
+    private var rowSecondaryInk: Color {
+        isSpotlit ? SpotlightFoil.ink.opacity(0.75) : Color.nodalong.textSecondary
+    }
+
     private var fullBleedBody: some View {
         cardContent
             .frame(height: 160)
             .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
             .overlay {
+                // A spotlit card no longer needs a gold RING — the whole card
+                // is foil. What it still needs is definition against the
+                // background, so it keeps a hairline in the ramp's darkest
+                // stop rather than the bright token.
                 RoundedRectangle(cornerRadius: Corner.container, style: .continuous)
                     .strokeBorder(
                         isSpotlit
-                            ? Color.nodalong.gold.opacity(0.65 + 0.35 * spotlightPulse)
+                            ? Color(hex: "#8E6C1F").opacity(0.9)
                             : Color.nodalong.textOnAccent.opacity(0.08),
-                        lineWidth: isSpotlit ? 2 : 0.5
+                        lineWidth: isSpotlit ? 1 : 0.5
                     )
             }
             .shadow(color: .black.opacity(0.2), radius: 14, y: 4)
             .shadow(
-                color: isSpotlit ? Color.nodalong.gold.opacity(0.35 + 0.45 * spotlightPulse) : .clear,
-                radius: isSpotlit ? 14 + 18 * spotlightPulse : 0
+                color: isSpotlit ? SpotlightFoil.glow.opacity(0.40 + 0.45 * spotlightPulse) : .clear,
+                radius: isSpotlit ? 16 + 18 * spotlightPulse : 0
             )
             .onAppear {
                 guard isSpotlit else { return }
@@ -131,7 +149,15 @@ struct TrackCard: View {
         // Cap the decode at the 600 px source rather than the (larger) 3× display
         // width — same on-screen quality, far smaller bitmap in RAM.
         let sizedArtwork = ArtworkURL.sized(artwork, points: ScreenMetrics.bounds.width)
-        return Color.nodalong.bgCard
+        return Group {
+            if isSpotlit {
+                // Foil is the SURFACE; the artwork below is composited onto
+                // it rather than the other way round. See `SpotlightFoil`.
+                SpotlightFoil.sheen
+            } else {
+                Color.nodalong.bgCard
+            }
+        }
             .overlay {
                 if sizedArtwork.isEmpty {
                     // No artwork exists for this track (MusicKit catalog gap) —
@@ -144,25 +170,17 @@ struct TrackCard: View {
                         placeholder: { ShimmerView() },
                         failure: { noArtworkPlaceholder }
                     )
+                    // `.multiply` keeps the foil dominant and lets the cover
+                    // modulate it — the art reads as pressed into the metal.
+                    // Multiply is commutative, so compositing the art over
+                    // the foil gives the same result as the reverse.
+                    .opacity(isSpotlit ? SpotlightFoil.artworkOpacity : 1)
+                    .blendMode(isSpotlit ? .multiply : .normal)
                 }
             }
-            .overlay {
-                // A spotlit track gets a soft gold wash across the top of the
-                // artwork, on top of the base image but underneath the black
-                // legibility scrim below — static (not part of the pulse),
-                // so it reads as "this artwork is spotlit" at a glance
-                // without competing with the breathing glow/border.
-                if isSpotlit {
-                    LinearGradient(
-                        stops: [
-                            .init(color: Color.nodalong.gold.opacity(0.28), location: 0.0),
-                            .init(color: Color.nodalong.gold.opacity(0.0),   location: 0.4),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                }
-            }
+            // Confines the blend to this card — without it `.multiply` would
+            // composite against whatever sits behind the card too.
+            .compositingGroup()
             .overlay {
                 // Deliberately absolute black, not an adaptive token — this
                 // scrims text over unpredictable album-art photos for
@@ -196,14 +214,16 @@ struct TrackCard: View {
                                 HStack(spacing: 3) {
                                     Image(systemName: Icons.star)
                                         .font(.system(size: 10, weight: .bold))
-                                        .foregroundStyle(Color(hex: "#1A1A1A"))
+                                        .foregroundStyle(SpotlightFoil.ink)
                                     Text("Spotlight")
                                         .font(Font.nodalong.custom(10, .medium))
-                                        .foregroundStyle(Color(hex: "#1A1A1A"))
+                                        .foregroundStyle(SpotlightFoil.ink)
                                 }
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 3)
-                                .background(Color.nodalong.gold)
+                                // Frosted, not gold — a gold pill on a gold
+                                // card is invisible.
+                                .background(SpotlightFoil.badgeBacking)
                                 .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
                                 .scaleEffect(1 + 0.12 * spotlightPulse)
                                 // Never compress/wrap this badge — under
@@ -218,7 +238,10 @@ struct TrackCard: View {
                                 Button(action: onSpotlight) {
                                     Image(systemName: isSpotlit ? Icons.star : "star")
                                         .font(.system(size: 22))
-                                        .foregroundStyle(isSpotlit ? Color.nodalong.gold : Color.nodalong.textOnAccent.opacity(0.85))
+                                        // Dark ink when spotlit: the card is
+                                        // foil behind it, so the gold token
+                                        // would disappear into it.
+                                        .foregroundStyle(isSpotlit ? SpotlightFoil.ink : Color.nodalong.textOnAccent.opacity(0.85))
                                         .shadow(color: .black.opacity(0.7), radius: 4, y: 1)
                                 }
                                 .buttonStyle(.plain)
@@ -293,29 +316,29 @@ struct TrackCard: View {
                     HStack(spacing: 3) {
                         Image(systemName: Icons.star)
                             .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(Color(hex: "#1A1A1A"))
+                            .foregroundStyle(SpotlightFoil.ink)
                         Text("Spotlight")
                             .font(Font.nodalong.custom(10, .medium))
-                            .foregroundStyle(Color(hex: "#1A1A1A"))
+                            .foregroundStyle(SpotlightFoil.ink)
                     }
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
-                    .background(Color.nodalong.gold)
+                    .background(SpotlightFoil.badgeBacking)
                     .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
                     .fixedSize(horizontal: true, vertical: false)
                 }
                 Text(title)
                     .font(Font.nodalong.custom(15, .semibold))
-                    .foregroundStyle(Color.nodalong.textPrimary)
+                    .foregroundStyle(rowPrimaryInk)
                     .lineLimit(1)
                 Text(artist)
                     .font(Font.nodalong.custom(12))
-                    .foregroundStyle(Color.nodalong.textSecondary)
+                    .foregroundStyle(rowSecondaryInk)
                     .lineLimit(1)
                 if !album.isEmpty {
                     Text(album)
                         .font(Font.nodalong.custom(12))
-                        .foregroundStyle(Color.nodalong.textSecondary.opacity(0.7))
+                        .foregroundStyle(rowSecondaryInk.opacity(0.8))
                         .lineLimit(1)
                 }
                 if let username {
@@ -323,7 +346,7 @@ struct TrackCard: View {
                 } else if let nods, nods > 0 {
                     Text("\(nods) \(nods == 1 ? "nod" : "nods")")
                         .font(Font.nodalong.custom(11))
-                        .foregroundStyle(Color.nodalong.textSecondary)
+                        .foregroundStyle(rowSecondaryInk)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -333,13 +356,18 @@ struct TrackCard: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(height: Self.rowHeight)
-        .background(Color.nodalong.bgCard)
+        .background {
+            // Whole-row foil, matching `.fullBleed`. No artwork multiply here
+            // — the row shows its cover as a separate sleeve/disc cluster
+            // rather than as the surface itself.
+            if isSpotlit { SpotlightFoil.sheen } else { Color.nodalong.bgCard }
+        }
         .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: Corner.container, style: .continuous)
                 .strokeBorder(
-                    isSpotlit ? Color.nodalong.gold.opacity(0.8) : Color.nodalong.textPrimary.opacity(0.08),
-                    lineWidth: isSpotlit ? 2 : 0.5
+                    isSpotlit ? Color(hex: "#8E6C1F").opacity(0.9) : Color.nodalong.textPrimary.opacity(0.08),
+                    lineWidth: isSpotlit ? 1 : 0.5
                 )
         }
         // Much lighter than `.fullBleed`'s shadow — this card sits on the
@@ -413,7 +441,7 @@ struct TrackCard: View {
                 Button(action: onToggleLike) {
                     Image(systemName: isLiked ? Icons.heart : Icons.heartOutline)
                         .font(.system(size: 20))
-                        .foregroundStyle(isLiked ? Color.nodalong.purpleAccent : Color.nodalong.textPrimary.opacity(0.55))
+                        .foregroundStyle(isLiked ? Color.nodalong.purpleAccent : rowSecondaryInk.opacity(0.8))
                         .frame(width: 44, height: 44)
                         .contentShape(.rect)
                 }
@@ -428,7 +456,8 @@ struct TrackCard: View {
             // queue entry too; both now reach the same destination, so
             // having two entry points is no longer a correctness problem.
             if onAddToQueue != nil {
-                AddToQueueButton(song: addToPlaylistSong, onAddToQueue: onAddToQueue)
+                AddToQueueButton(song: addToPlaylistSong, onAddToQueue: onAddToQueue,
+                                 tint: isSpotlit ? SpotlightFoil.ink.opacity(0.8) : nil)
                     .frame(width: 44, height: 44)
             }
             if onAddToQueue != nil || addToPlaylistSong != nil {
@@ -436,7 +465,8 @@ struct TrackCard: View {
                     song: addToPlaylistSong,
                     onAddToQueue: onAddToQueue,
                     onSpotlight: onSpotlight,
-                    isSpotlit: isSpotlit
+                    isSpotlit: isSpotlit,
+                    tint: isSpotlit ? SpotlightFoil.ink.opacity(0.8) : nil
                 )
                 .frame(width: 44, height: 44)
             }

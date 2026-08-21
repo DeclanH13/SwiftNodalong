@@ -23,6 +23,10 @@ struct TrackActionsMenuButton: View {
     var isLiked: Bool = false
     var onSpotlight: (() -> Void)? = nil
     var isSpotlit: Bool = false
+    /// Overrides the glyph colour. Needed on a spotlit `.row`, whose surface
+    /// is appearance-independent gold foil — the default here is a mode-aware
+    /// token, which is near-white in dark mode and disappears on gold.
+    var tint: Color? = nil
 
     @EnvironmentObject private var partyVM: ListeningPartyViewModel
     @State private var showDialog = false
@@ -42,7 +46,7 @@ struct TrackActionsMenuButton: View {
         } label: {
             Image(systemName: Icons.moreActions)
                 .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Color.nodalong.textOnAccent.opacity(0.85))
+                .foregroundStyle(tint ?? Color.nodalong.textOnAccent.opacity(0.85))
                 .frame(width: 32, height: 32)
                 .contentShape(.rect)
         }

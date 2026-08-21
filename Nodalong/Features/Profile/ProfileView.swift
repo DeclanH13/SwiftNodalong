@@ -591,6 +591,10 @@ struct ProfileView: View {
         if spotlightHistory != newHistory   { spotlightHistory = newHistory }
         hasLoaded = true
 
+        // One tap away: the follower/following counts are right there on
+        // screen, so resolve those lists now rather than when tapped.
+        SocialCache.shared.prefetchFollowLists(uid: uid)
+
         SnapshotStore.save(
             ProfileSnapshot(
                 spotlightHistory: newHistory,

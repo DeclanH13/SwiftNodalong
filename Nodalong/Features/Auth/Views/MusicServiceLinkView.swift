@@ -11,6 +11,11 @@ import SwiftUI
 /// which updates `authVM.profile` and flips `ContentView.shouldShowMusicLink`
 /// false.
 struct MusicServiceLinkView: View {
+    /// Called when the user chooses "Not now". `ContentView` persists this so
+    /// the cover doesn't immediately re-present. Optional so existing
+    /// previews and any other caller keep compiling unchanged.
+    var onSkip: (() -> Void)? = nil
+
     @EnvironmentObject private var musicService: AppleMusicService
     @Environment(FirebaseAuthViewModel.self) private var authVM
     @EnvironmentObject private var playerVM:     PlayerViewModel
@@ -79,6 +84,19 @@ struct MusicServiceLinkView: View {
                     Text("You'll be prompted to allow access.")
                         .font(Font.nodalong.caption)
                         .foregroundStyle(Color.nodalong.textOnAccent.opacity(0.5))
+
+                    // The way out. Without it this screen is a hard lockout:
+                    // the button above disables itself once MusicKit reports
+                    // `.denied`, and the cover only dismisses on a successful
+                    // connect — so a single "Don't Allow" trapped the user
+                    // with no route forward. Connecting later lives in
+                    // Profile → Music Services.
+                    if let onSkip {
+                        Button("Not now", action: onSkip)
+                            .font(Font.nodalong.subheadlineMedium)
+                            .foregroundStyle(Color.nodalong.textOnAccent.opacity(0.8))
+                            .padding(.top, 4)
+                    }
                 }
                 .padding(.horizontal, 32)
                 .padding(.bottom, 56)
