@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import FirebaseCore
 
 /// App entry point — owns every long-lived view model and injects them via
@@ -19,6 +20,11 @@ struct NodalongApp: App {
     @StateObject private var spotifyService  = SpotifyMusicService()
     @StateObject private var syncService     = LibrarySyncService()
     @StateObject private var locationService = LocationService()
+    @StateObject private var playlistGenerator = PlaylistGenerator()
+    /// Home's per-user section pin/hide choices. App-wide because
+    /// `HomeLayoutSheet` reads it too, and both live under `HomeView`'s own
+    /// NavigationStack rather than one shared parent.
+    @StateObject private var homeLayout      = HomeLayoutPreferences()
     @StateObject private var playerVM        = PlayerViewModel()
     @StateObject private var libraryVM       = LibraryViewModel()
     @StateObject private var nowPlayingBroadcast = NowPlayingBroadcastService()
@@ -60,12 +66,27 @@ struct NodalongApp: App {
                 .environmentObject(spotifyService)
                 .environmentObject(syncService)
                 .environmentObject(locationService)
+                .environmentObject(playlistGenerator)
+                .environmentObject(homeLayout)
                 .environmentObject(playerVM)
                 .environmentObject(playerVM.clock)
                 .environmentObject(libraryVM)
                 .environmentObject(nowPlayingBroadcast)
                 .environmentObject(syncCoordinator)
                 .preferredColorScheme(appearanceMode.colorScheme)
+                .task { resetAppIcon() }
         }
+    }
+
+    /// The app icon is a single fixed purple/white mark and never follows the
+    /// appearance toggle. Earlier builds switched to alternate icons
+    /// (AppIconLight/AppIconDark); this reverts any such install back to the
+    /// primary icon once. Best-effort, closure variant on purpose (see the
+    /// DTS-unconfirmed crash report for the async variant in XcodeGen +
+    /// local-SwiftPM projects).
+    private func resetAppIcon() {
+        guard UIApplication.shared.supportsAlternateIcons,
+              UIApplication.shared.alternateIconName != nil else { return }
+        UIApplication.shared.setAlternateIconName(nil) { _ in }
     }
 }

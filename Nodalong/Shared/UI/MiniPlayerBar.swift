@@ -95,6 +95,7 @@ struct MiniPlayerBar: View {
             // buttons correctly claim priority over an ancestor `Button`'s
             // own action, unlike a plain `.onTapGesture`.
             Button {
+                FieldLog.event("player", "mini player tapped (isExpanded was \(playerVM.isExpanded))")
                 playerVM.isExpanded = true
             } label: {
             HStack(spacing: 12) {
@@ -160,8 +161,8 @@ struct MiniPlayerBar: View {
                     Button {
                         if partyVM.isActive { partyVM.reopen() } else { partyVM.showStartPartySheet = true }
                     } label: {
-                        NodalongMark(size: 30)
-                            .foregroundStyle(partyVM.isActive ? Color.nodalong.purpleAccent : Color.nodalong.textOnAccent.opacity(0.75))
+                        NodalongMark(size: 34)
+                            .foregroundStyle(Color.nodalong.textOnAccent)
                             .frame(width: 36, height: 36)
                             .contentShape(.rect)
                     }
@@ -170,8 +171,8 @@ struct MiniPlayerBar: View {
                     // Following (radio / view-only): no transport, just a
                     // live indicator — leaving is via `NowPlayingView`'s own
                     // "Leave" affordance, not from this bar.
-                    NodalongMark(size: 30)
-                        .foregroundStyle(Color.nodalong.purpleAccent)
+                    NodalongMark(size: 34)
+                        .foregroundStyle(Color.nodalong.textOnAccent)
                         .frame(width: 36, height: 36)
                 }
             }

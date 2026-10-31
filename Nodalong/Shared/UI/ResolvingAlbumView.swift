@@ -15,6 +15,21 @@ struct ResolvingAlbumView: View {
     @State private var resolved: AlbumResult?
     @State private var notFound = false
 
+    /// `cached` is a synchronous cache read made by the caller at push time
+    /// (`MusicDetailCache.peekResolvedAlbum`, `cachedPendingAlbum`). When it
+    /// hits, `resolved` is set before the first render, so a warm tap lands
+    /// straight on `AlbumDetailSearchView` — no placeholder frame and no
+    /// cross-fade, which no amount of prefetching could remove while
+    /// `resolved` could only be filled from `.task`.
+    init(name: String, artistName: String, artwork: String, cached: AlbumResult? = nil,
+         resolve: @escaping () async -> AlbumResult?) {
+        self.name = name
+        self.artistName = artistName
+        self.artwork = artwork
+        self.resolve = resolve
+        _resolved = State(initialValue: cached)
+    }
+
     var body: some View {
         Group {
             if let resolved {
@@ -32,8 +47,11 @@ struct ResolvingAlbumView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         VStack(spacing: 12) {
-                            ArtworkThumbnail(url: artwork, size: AlbumDetailSearchView.heroArtworkSize, isAlbum: true)
-                                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
+                            // Matches the real hero it swaps to (`AlbumDetailSearchView`, which
+                            // also passes `flipsOnTap: true`) so the disc keeps rocking
+                            // through the resolve instead of starting still and only
+                            // coming alive once the swap lands.
+                            ArtworkThumbnail(url: artwork, size: AlbumDetailSearchView.heroArtworkSize, isAlbum: true, flipsOnTap: true)
                             VStack(spacing: 4) {
                                 Text(name)
                                     .font(Font.nodalong.title3Bold)
@@ -100,11 +118,11 @@ struct ResolvingAlbumView: View {
                         .padding(.horizontal, 16)
                     }
                 }
-                .background(Color.nodalong.bgBase)
-                .navigationTitle(name)
-                .navigationBarTitleDisplayMode(.inline)
+                .screenBackground()
+                .screenControls()
             }
         }
+        .toolbar(.hidden, for: .navigationBar)
         .task {
             guard resolved == nil, !notFound else { return }
             await attemptResolve()

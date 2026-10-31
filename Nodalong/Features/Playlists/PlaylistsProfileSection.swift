@@ -53,6 +53,13 @@ struct PlaylistsProfileSection: View {
             .background(Color.nodalong.bgCard)
             .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
         }
+        // Your manual/party playlists aren't warmed at launch (only generated
+        // ones are), so the first open of each used to load. Capped inside.
+        .task(id: playlistsVM.playlists.map(\.id)) {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            await PlaylistTracksCache.prefetch(playlistsVM.playlists, viewerUid: authVM.currentUser?.uid)
+        }
         .sheet(isPresented: $showCreate) { CreatePlaylistSheet() }
     }
 
@@ -87,12 +94,22 @@ struct PlaylistTile: View {
         VStack(alignment: .leading, spacing: 8) {
             GeometryReader { geo in
                 ArtworkThumbnail(url: playlist.coverArtwork, size: geo.size.width)
-                    .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous))
                     .overlay(alignment: .bottomTrailing) {
                         if playlist.source == .party {
                             NodalongMark(size: 24)
                                 .foregroundStyle(Color.nodalong.textOnAccent)
                                 .padding(5)
+                                .background(Color.nodalong.purpleAccent, in: Circle())
+                                .padding(6)
+                        } else if playlist.source == .generated {
+                            // Distinct glyph from the party mark so the two
+                            // machine-made playlist kinds don't read as the same
+                            // thing at a glance.
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Color.nodalong.textOnAccent)
+                                .padding(7)
                                 .background(Color.nodalong.purpleAccent, in: Circle())
                                 .padding(6)
                         }

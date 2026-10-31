@@ -56,7 +56,6 @@ struct TrackCard: View {
     var isSpotlit:   Bool    = false
 
     var onPlay:        (() -> Void)? = nil
-    var onSpotlight:   (() -> Void)? = nil
     var onToggleLike:  (() -> Void)? = nil
     var isLiked:       Bool          = false
     var onAddToQueue:  (() -> Void)? = nil
@@ -210,7 +209,7 @@ struct TrackCard: View {
                         }
                         Spacer(minLength: 8)
                         HStack(spacing: 14) {
-                            if onSpotlight == nil && isSpotlit {
+                            if isSpotlit {
                                 HStack(spacing: 3) {
                                     Image(systemName: Icons.star)
                                         .font(.system(size: 10, weight: .bold))
@@ -233,18 +232,6 @@ struct TrackCard: View {
                                 // .lineLimit(1)), not "Spotlight" wrapping to
                                 // two lines.
                                 .fixedSize(horizontal: true, vertical: false)
-                            }
-                            if let onSpotlight {
-                                Button(action: onSpotlight) {
-                                    Image(systemName: isSpotlit ? Icons.star : "star")
-                                        .font(.system(size: 22))
-                                        // Dark ink when spotlit: the card is
-                                        // foil behind it, so the gold token
-                                        // would disappear into it.
-                                        .foregroundStyle(isSpotlit ? SpotlightFoil.ink : Color.nodalong.textOnAccent.opacity(0.85))
-                                        .shadow(color: .black.opacity(0.7), radius: 4, y: 1)
-                                }
-                                .buttonStyle(.plain)
                             }
                             if let onToggleLike {
                                 Button(action: onToggleLike) {
@@ -287,7 +274,7 @@ struct TrackCard: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                        if onAddToQueue != nil || addToPlaylistSong != nil {
+                        if let addToPlaylistSong {
                             TrackActionsMenuButton(song: addToPlaylistSong, onAddToQueue: onAddToQueue)
                                 .shadow(color: .black.opacity(0.7), radius: 4, y: 1)
                         }
@@ -460,12 +447,10 @@ struct TrackCard: View {
                                  tint: isSpotlit ? SpotlightFoil.ink.opacity(0.8) : nil)
                     .frame(width: 44, height: 44)
             }
-            if onAddToQueue != nil || addToPlaylistSong != nil {
+            if let addToPlaylistSong {
                 TrackActionsMenuButton(
                     song: addToPlaylistSong,
                     onAddToQueue: onAddToQueue,
-                    onSpotlight: onSpotlight,
-                    isSpotlit: isSpotlit,
                     tint: isSpotlit ? SpotlightFoil.ink.opacity(0.8) : nil
                 )
                 .frame(width: 44, height: 44)

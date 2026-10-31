@@ -1,11 +1,12 @@
 import SwiftUI
 import NodalongKit
 
-/// Adds a persistent avatar button to a screen's navigation bar that pushes
-/// the current user's own `ProfileView` onto THAT screen's navigation
-/// stack — so the back button always returns to wherever the user tapped
-/// from. Part of Tab Navigation 2.0: Profile is no longer its own tab, but a
-/// global entry point reachable from every tab.
+/// Adds a persistent entry point to a screen that pushes the current user's
+/// own `ProfileView` onto THAT screen's navigation stack — so the back
+/// button always returns to wherever the user tapped from. Part of Tab
+/// Navigation 2.0: Profile is no longer its own tab, but a global entry
+/// point reachable from every tab (via `ProfileAvatarButton`/
+/// `ProfileAvatarRow`, below).
 ///
 /// Self-contained (owns its own presentation state), so it composes safely
 /// alongside any other `.navigationDestination` a host screen already has —
@@ -17,22 +18,64 @@ import NodalongKit
 /// than `.navigationDestination(isPresented:)`.
 struct OwnProfileRoute: Hashable {}
 
-struct ProfileEntryPoint: ViewModifier {
+/// The user's own avatar, always in the top-trailing corner of a tab root as
+/// ordinary layout rather than a floating overlay — so it can never overlap
+/// other content. A single tap opens Profile.
+///
+/// Supersedes `ProfileAvatarPeek`'s two-tap reveal: that existed solely to
+/// protect against a mis-tap on a sliver that sat over real content, and
+/// once the avatar has its own reserved space there's nothing left to
+/// protect against.
+struct ProfileAvatarButton: View {
     @Environment(FirebaseAuthViewModel.self) private var authVM
+    @EnvironmentObject private var router: AppRouter
 
+    var body: some View {
+        Button {
+            router.push(OwnProfileRoute(), onto: router.selectedTab)
+        } label: {
+            AvatarView(
+                emoji: authVM.profile?.avatarEmoji,
+                colorHex: authVM.profile?.avatarColor,
+                size: 34
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Your profile")
+    }
+}
+
+/// A dedicated top-right row holding just the avatar — the ONE placement
+/// every tab root uses (`HomeView`, `FeedView`, `SearchView`, `ShelfView`,
+/// `NearMeView`), always as the first row of the screen's content, so the
+/// avatar lands in the same spot on all five.
+///
+/// Deliberately inline content, never a `.screenControls(trailing:)`
+/// floating overlay. An overlay is pinned to the screen while Search's and
+/// Shelf's headers scroll, so at some offsets it sat on top of the search
+/// bar or the segmented picker. Reserving real space is the only version
+/// that structurally cannot overlap anything. On the four scrolling tabs it
+/// scrolls away with the rest of the header; NearMe's header doesn't
+/// scroll, so there it simply stays put.
+struct ProfileAvatarRow: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Spacer()
+            InboxBellButton()
+            ProfileAvatarButton()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+}
+
+/// Registers the own-profile push destination. The avatar that triggers it is
+/// now `ProfileAvatarButton`/`ProfileAvatarRow`, placed in each tab root's
+/// own layout — the two are separate because the destination must be a
+/// modifier on the stack while the button is ordinary content.
+struct ProfileEntryPoint: ViewModifier {
     func body(content: Content) -> some View {
         content
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    NavigationLink(value: OwnProfileRoute()) {
-                        AvatarView(
-                            emoji: authVM.profile?.avatarEmoji,
-                            colorHex: authVM.profile?.avatarColor,
-                            size: 30
-                        )
-                    }
-                }
-            }
             // Value-based, NOT `.navigationDestination(isPresented:)`.
             //
             // The boolean form was the root of a long-running navigation
@@ -54,13 +97,17 @@ struct ProfileEntryPoint: ViewModifier {
             .navigationDestination(for: OwnProfileRoute.self) { _ in
                 ProfileView()
             }
+            .navigationDestination(for: InboxRoute.self) { _ in
+                InboxView()
+            }
     }
 }
 
 extension View {
-    /// Adds the persistent own-profile avatar button + push destination.
-    /// Apply once per tab root (`HomeView`, `FeedView`, `NearMeView`,
-    /// `ShelfView`).
+    /// Registers the own-profile push destination. Apply once per tab root
+    /// (`HomeView`, `FeedView`, `NearMeView`, `ShelfView`, `SearchView`);
+    /// pair it with a `ProfileAvatarButton`/`ProfileAvatarRow` in that
+    /// screen's own layout.
     func profileEntryPoint() -> some View {
         modifier(ProfileEntryPoint())
     }

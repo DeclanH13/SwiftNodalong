@@ -18,6 +18,12 @@ import NodalongKit
 /// sheet (rather than a `NavigationStack` wrapping this view) keeps the
 /// fragile `ScreenMetrics.bounds`-pinned layout untouched.
 struct NowPlayingView: View {
+    /// The full player's artwork size. A static so `PlayerViewModel` can
+    /// warm exactly this rendition before the player is opened.
+    @MainActor static var heroArtworkSide: CGFloat {
+        min(ScreenMetrics.bounds.width - 48, ScreenMetrics.bounds.height * 0.42)
+    }
+
     @EnvironmentObject private var playerVM:       PlayerViewModel
     @EnvironmentObject private var clock:          PlaybackClock
     @EnvironmentObject private var libraryVM:      LibraryViewModel
@@ -115,19 +121,10 @@ struct NowPlayingView: View {
         }
     }
 
-    /// The device's true safe-area insets, read straight from the key window.
-    /// Unlike the SwiftUI environment (or a `GeometryReader`) inside this cover,
-    /// the window's `safeAreaInsets` reflect only the physical notch / Dynamic
-    /// Island / home indicator — they are NOT affected by the tab bar's
-    /// `safeAreaInset`, so they don't carry the leaked phantom inset.
-    private var deviceSafeAreaInsets: UIEdgeInsets {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow }?
-            .safeAreaInsets
-            ?? UIEdgeInsets(top: 50, left: 0, bottom: 34, right: 0)
-    }
+    /// The device's true safe-area insets — see `ScreenMetrics.safeAreaInsets`
+    /// for why this is read from the key window rather than the environment.
+    /// Shared with `TrackActionsSheet`, which pins itself the same way.
+    private var deviceSafeAreaInsets: UIEdgeInsets { ScreenMetrics.safeAreaInsets }
 
     // MARK: - Background
 
@@ -212,16 +209,14 @@ struct NowPlayingView: View {
     /// Same affordance the pushed-screen back button already uses — a glyph
     /// on a circular fill — so this reads as the app's existing language
     /// rather than a new one.
+    /// Now just the shared `HeaderGlyph`. This treatment originated here (it
+    /// was built so the chevron-down and queue glyphs stayed legible over
+    /// arbitrary album art, which no fixed colour can do) and was extracted
+    /// when the nav bar was removed app-wide, so every hand-rolled back
+    /// button uses the same shape. Kept as a wrapper rather than replacing
+    /// the two call sites, so the reason it exists stays documented here.
     private func topBarGlyph(_ systemName: String) -> some View {
-        Image(systemName: systemName)
-            .font(Font.nodalong.title3Semibold)
-            .foregroundStyle(Color.nodalong.textPrimary)
-            .frame(width: 44, height: 44)
-            .background(.ultraThinMaterial, in: Circle())
-            .overlay(
-                Circle().strokeBorder(Color.nodalong.textPrimary.opacity(0.10), lineWidth: 0.5)
-            )
-            .contentShape(Circle())
+        HeaderGlyph(systemName)
     }
 
     // MARK: - Artwork
@@ -230,8 +225,7 @@ struct NowPlayingView: View {
         // Near-full-width on tall phones, height-capped on short ones so the
         // control cluster always fits. `-48` matches the body's 24pt h-padding
         // ×2.  iPhone 15 → ~345pt, Pro Max → ~382pt, SE → height-capped ~280pt.
-        let side = min(ScreenMetrics.bounds.width - 48,
-                       ScreenMetrics.bounds.height * 0.42)
+        let side = Self.heroArtworkSide
         let url = playerVM.nowPlaying?.artwork ?? ""
 
         // Branches on the artwork-style setting — unlike every other
@@ -304,12 +298,23 @@ struct NowPlayingView: View {
                     // the multi-artist picker, if the track credits more than
                     // one) in the background. See `ResolvingArtistsView`.
                     Button {
-                        router.dismissThenPush(
-                            PendingArtistResolve(
-                                trackTitle: track.title, artist: track.artist,
-                                catalogId: track.catalogId, isrc: track.isrc, uri: track.uri
-                            )
-                        ) { playerVM.isExpanded = false }
+                        // Already resolved to exactly one artist by the
+                        // player's own prefetch → push the real page, not
+                        // the resolving placeholder.
+                        if let cached = playerVM.prefetchedArtistsForUri, cached.uri == track.uri,
+                           cached.artists.count == 1 {
+                            router.dismissThenPush(cached.artists[0], identity: .artist(name: track.artist)) {
+                                playerVM.isExpanded = false
+                            }
+                        } else {
+                            router.dismissThenPush(
+                                PendingArtistResolve(
+                                    trackTitle: track.title, artist: track.artist,
+                                    catalogId: track.catalogId, isrc: track.isrc, uri: track.uri
+                                ),
+                                identity: .artist(name: track.artist)
+                            ) { playerVM.isExpanded = false }
+                        }
                     } label: {
                         MarqueeText(text: track.artist, font: Font.nodalong.subheadline, color: Color.nodalong.textPrimary.opacity(0.65), repeats: true)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -320,12 +325,20 @@ struct NowPlayingView: View {
                     // tab the user was on so the tab bar stays reachable.
                     if !track.album.isEmpty {
                         Button {
+                            if let cached = playerVM.prefetchedAlbumForUri, cached.uri == track.uri {
+                                router.dismissThenPush(cached.album, identity: .album(name: track.album, artist: track.artist)) {
+                                    playerVM.isExpanded = false
+                                }
+                            } else {
                             router.dismissThenPush(
                                 PendingAlbumResolve(
                                     albumName: track.album, artist: track.artist, artwork: track.artwork,
-                                    catalogId: track.catalogId, isrc: track.isrc, uri: track.uri
-                                )
+                                    catalogId: track.catalogId, isrc: track.isrc, uri: track.uri,
+                                    trackTitle: track.title
+                                ),
+                                identity: .album(name: track.album, artist: track.artist)
                             ) { playerVM.isExpanded = false }
+                            }
                         } label: {
                             MarqueeText(text: track.album, font: Font.nodalong.subheadline, color: Color.nodalong.textPrimary.opacity(0.45), repeats: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -371,41 +384,23 @@ struct NowPlayingView: View {
 
     // MARK: - Spotlight button
 
-    /// Toggles today's spotlight for the current track — mirrors
-    /// `ProfileView`'s existing star (tapping an already-spotlit track
-    /// un-spotlights it, rather than being a one-way add).
+    /// Toggles today's spotlight for the current track (tapping an already-
+    /// spotlit track un-spotlights it).
     ///
-    /// **Disabled, not hidden, once the daily cap of 3 is reached** — un-
-    /// spotlighting stays available at the cap (so a user can swap one out
-    /// without leaving this screen), only adding a NEW one is blocked.
-    /// `authVM.atSpotlightLimit` already existed for exactly this purpose
-    /// with zero call sites before this — this is its first real use, so no
-    /// new limit-tracking logic was needed.
-    ///
-    /// No limit alert here, unlike `FeedView`/`ProfileView`/`ShelfView` (all
-    /// of which sit BEHIND this screen's `fullScreenCover`, so their alerts
-    /// can't surface while it's up) — `addToSpotlight` only sets
-    /// `spotlightLimitReached` under exactly the condition `isDisabled`
-    /// already blocks here, both reading the same derived
-    /// `profile?.spotlightTracks` data, so the alert is structurally
-    /// unreachable from this button.
+    /// Only two things disable it: the track is not already one of today's
+    /// picks AND the daily cap of 3 is reached. A missing `catalogId` is NOT
+    /// one of them — tracks started from Search, an album or Top Songs have
+    /// none, and this star used to stay greyed out for all of them.
+    /// `FirebaseAuthViewModel.toggleSpotlight` creates the catalog row at tap
+    /// time instead.
     @ViewBuilder
     private func spotlightButton(track: NowPlayingTrack) -> some View {
-        let catalogId = track.catalogId ?? ""
-        let isSpotlit = authVM.todaySpotlitIds.contains(catalogId)
-        // A track with no catalogId can never be spotlit meaningfully — it
-        // would write an entry keyed by "" that no read surface could match
-        // back to this track.
-        let isDisabled = catalogId.isEmpty || (authVM.atSpotlightLimit && !isSpotlit)
+        let song = spotlightSong(for: track)
+        let isSpotlit = authVM.todaySpotlight(matching: song) != nil
+        let isDisabled = !authVM.canSpotlight(song)
 
         Button {
-            Task {
-                if isSpotlit {
-                    await authVM.removeFromSpotlight(trackId: catalogId)
-                } else {
-                    await authVM.addToSpotlight(libraryDoc(track: track))
-                }
-            }
+            Task { await authVM.toggleSpotlight(song) }
         } label: {
             Image(systemName: isSpotlit ? Icons.star : "star")
                 .font(.system(size: 24))
@@ -419,6 +414,20 @@ struct NowPlayingView: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+    }
+
+    /// The full `Song` behind the Now Playing track — the queue's own item when
+    /// it is the same track (it carries ISRC, genres, track number and so on),
+    /// otherwise one rebuilt from what Now Playing knows (e.g. while tuned in
+    /// to someone else's broadcast, when there is no local queue).
+    private func spotlightSong(for track: NowPlayingTrack) -> Song {
+        if let item = playerVM.currentItem?.song, item.uri == track.uri { return item }
+        return Song(
+            id: track.uri, title: track.title, artist: track.artist, album: track.album,
+            artwork: track.artwork, trackId: track.uri, uri: track.uri,
+            catalogId: track.catalogId, sourceService: playerVM.activeService,
+            isrc: track.isrc, duration: Int(playerVM.currentDuration * 1000)
+        )
     }
 
     /// Shared by `heartButton` (shelf save) and `spotlightButton` (spotlight

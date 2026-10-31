@@ -139,3 +139,14 @@ public func albumNamesExactMatch(_ candidate: String, _ expected: String) -> Boo
     guard !c.isEmpty, !e.isEmpty else { return false }
     return c == e
 }
+
+/// True for the generic "Track 6" names Apple lists for songs on a not-yet-
+/// released album. The catalog is ISRC-keyed and shared, so a row ingested
+/// while Apple still used a placeholder keeps that name for every user until
+/// something replaces it; a real title is always the better answer.
+public func isPlaceholderTrackTitle(_ title: String) -> Bool {
+    let t = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard t.hasPrefix("track ") else { return false }
+    let rest = t.dropFirst("track ".count)
+    return !rest.isEmpty && rest.allSatisfy(\.isNumber)
+}

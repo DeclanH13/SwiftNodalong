@@ -45,11 +45,20 @@ public struct FriendsListeningAlbum: Identifiable, Hashable, Sendable {
     /// several tracks off the album counts once.
     public let listeners: [FriendListener]
     public let mostRecentPlayedAt: Double
+    /// `true` when ANY track on the album is explicit — the convention music
+    /// apps use for an album-level mark.
+    ///
+    /// Note `false` is ambiguous: it means "no explicit track" OR "explicit
+    /// data not captured yet" (see `CatalogTrack.isExplicit`). Treating both
+    /// the same way is deliberate — marking an album explicit on incomplete
+    /// data would be worse than marking it late.
+    public let isExplicit: Bool
 
     public init(
         id: String, albumName: String, artistName: String, artwork: String,
         catalogId: String, uri: String, isrc: String? = nil, trackTitle: String = "",
-        listeners: [FriendListener], mostRecentPlayedAt: Double
+        listeners: [FriendListener], mostRecentPlayedAt: Double,
+        isExplicit: Bool = false
     ) {
         self.id = id
         self.albumName = albumName
@@ -61,6 +70,7 @@ public struct FriendsListeningAlbum: Identifiable, Hashable, Sendable {
         self.trackTitle = trackTitle
         self.listeners = listeners
         self.mostRecentPlayedAt = mostRecentPlayedAt
+        self.isExplicit = isExplicit
     }
 }
 
@@ -108,7 +118,8 @@ public func friendsListeningAlbums(from posts: [Post]) -> [FriendsListeningAlbum
             id: key, albumName: latest.album, artistName: artistLabel, artwork: latest.artwork,
             catalogId: latest.catalogId, uri: latest.uri, isrc: latest.isrc,
             trackTitle: latest.title,
-            listeners: listeners, mostRecentPlayedAt: latest.createdAt
+            listeners: listeners, mostRecentPlayedAt: latest.createdAt,
+            isExplicit: groupPosts.contains(where: \.isExplicit)
         )
     }
     .sorted { a, b in

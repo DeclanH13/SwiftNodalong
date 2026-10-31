@@ -11,6 +11,8 @@ public struct SpotlightTrack: Codable, Hashable, Sendable {
     public let spotlitAt: Double
     public let catalogId: String?
     public let sourceService: MusicServiceType?
+    /// Overlaid from the catalog row on read; empty until it has genres.
+    public var genres: [String]
 
     public init(
         trackId: String,
@@ -21,8 +23,10 @@ public struct SpotlightTrack: Codable, Hashable, Sendable {
         uri: String,
         spotlitAt: Double,
         catalogId: String? = nil,
-        sourceService: MusicServiceType? = nil
+        sourceService: MusicServiceType? = nil,
+        genres: [String] = []
     ) {
+        self.genres = genres
         self.trackId = trackId
         self.title = title
         self.artist = artist
@@ -35,7 +39,7 @@ public struct SpotlightTrack: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trackId, title, artist, album, artwork, uri, spotlitAt, catalogId, sourceService
+        case trackId, title, artist, album, artwork, uri, spotlitAt, catalogId, sourceService, genres
     }
 
     // Tolerant decode: slim event docs carry only trackId/catalogId/spotlitAt/
@@ -52,6 +56,7 @@ public struct SpotlightTrack: Codable, Hashable, Sendable {
         spotlitAt     = try c.decodeIfPresent(Double.self, forKey: .spotlitAt) ?? 0
         catalogId     = try c.decodeIfPresent(String.self, forKey: .catalogId)
         sourceService = try c.decodeIfPresent(MusicServiceType.self, forKey: .sourceService)
+        genres        = (try? c.decode([String].self, forKey: .genres)) ?? []
     }
 
     /// Returns a copy with metadata taken from the catalog row (the source of
@@ -64,6 +69,7 @@ public struct SpotlightTrack: Codable, Hashable, Sendable {
         copy.album   = catalog.album
         copy.artwork = catalog.artwork
         copy.uri     = catalog.appleMusicUri ?? uri
+        if !catalog.genres.isEmpty { copy.genres = catalog.genres }
         return copy
     }
 }

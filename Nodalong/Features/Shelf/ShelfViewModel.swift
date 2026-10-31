@@ -14,11 +14,28 @@ final class ShelfViewModel: ObservableObject {
         case playlists = "Playlists"
         case albums = "Albums"
         case artists = "Artists"
+        case genres = "Genres"
         case recentlyLiked = "Liked"
     }
 
     @Published private(set) var tracks: [LibraryTrackDoc] = []
-    @Published var segment: Segment = .albums
+    @Published var segment: Segment = .albums {
+        didSet {
+            // A freshly-switched segment starts scrolled to the top, so a
+            // header left hidden would be stranded over a list that isn't
+            // scrolled. In the `didSet` rather than an `.onChange` at the view
+            // so no future call site that sets `segment` can forget.
+            guard segment != oldValue else { return }
+        }
+    }
+
+    /// Whether Shelf's tab-root header is currently scrolled away.
+    ///
+    /// Lives on the view model rather than as `ShelfView` `@State` because all
+    /// five segment views drive it and this is the only thing they share — the
+    /// alternative was threading a `Binding` through five separate view
+    /// signatures. Consistent with `segment` and `searchQuery`, which are
+    /// already presentation state held here.
     @Published var searchQuery = ""
     @Published private(set) var artistImages: [String: String] = [:]
 
@@ -67,6 +84,16 @@ final class ShelfViewModel: ObservableObject {
     /// "Liked" Shelf segment. Sorted once by `LibraryViewModel`, not per read.
     @Published private(set) var recentlyLiked: [LibraryTrackDoc] = []
 
+    /// The library bucketed by genre. Genre is overlaid from the shared
+    /// catalog, so this stays empty until rows have been through genre ingest.
+    @Published private(set) var genres: [GenreEntry] = []
+
+    var filteredGenres: [GenreEntry] {
+        guard !searchQuery.isEmpty else { return genres }
+        let tokens = tokenize(searchQuery)
+        return genres.filter { matchesAllTokens(tokens, fields: [$0.name.lowercased()]) }
+    }
+
     var filteredRecentlyLiked: [LibraryTrackDoc] {
         guard !searchQuery.isEmpty else { return recentlyLiked }
         let tokens = tokenize(searchQuery)
@@ -85,11 +112,13 @@ final class ShelfViewModel: ObservableObject {
         _ newTracks: [LibraryTrackDoc],
         albums: [AlbumGroup],
         artists: [ArtistEntry],
+        genres: [GenreEntry],
         recentlyLiked: [LibraryTrackDoc]
     ) {
         tracks = newTracks
         self.albums = albums
         self.artists = artists
+        self.genres = genres
         self.recentlyLiked = recentlyLiked
     }
 

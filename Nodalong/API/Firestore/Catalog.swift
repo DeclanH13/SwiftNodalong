@@ -65,7 +65,8 @@ func upsertCatalogTrack(_ input: CatalogTrackInput) async throws -> String {
             let track = CatalogTrack(
                 title: input.title, artist: input.artist, album: input.album, artwork: input.artwork,
                 duration: input.duration, isrc: input.isrc, trackNumber: input.trackNumber,
-                albumReleaseDate: input.albumReleaseDate,
+                albumReleaseDate: input.albumReleaseDate, genres: input.genres,
+                isExplicit: input.isExplicit,
                 appleMusicUri: input.appleMusicUri, appleMusicTrackId: input.appleMusicTrackId,
                 spotifyUri: input.spotifyUri, spotifyTrackId: input.spotifyTrackId,
                 createdAt: now, updatedAt: now
@@ -100,6 +101,23 @@ func upsertCatalogTrack(_ input: CatalogTrackInput) async throws -> String {
             updates["spotifyUri"]     = uri
             updates["spotifyTrackId"] = input.spotifyTrackId
         }
+        // Backfill genres onto rows written before genre capture existed. This
+        // is why no one-off repair sweep is needed: the ~4k existing rows heal
+        // incrementally as they're touched by normal syncing, at no extra cost.
+        // Only fills an EMPTY field — never overwrites genres already stored,
+        // so this can't regress a good row (same one-directional principle as
+        // the release repair below).
+        if existing.genres.isEmpty, !input.genres.isEmpty {
+            updates["genres"] = input.genres
+        }
+        // Same incremental backfill for the explicit flag. One-directional in
+        // the only direction that's safe: `false` is indistinguishable from
+        // "not captured yet", so this can promote false→true but never the
+        // reverse — a row correctly marked explicit can't be cleared by a
+        // later ingest that happens to lack the data.
+        if !existing.isExplicit, input.isExplicit {
+            updates["isExplicit"] = true
+        }
         // Self-heal a catalog row whose artwork/album got permanently baked
         // in from a weaker first match — either a "Greatest Hits"-style
         // compilation, or (the Salt of the Lee / Dungarvan Bay case) the
@@ -119,6 +137,20 @@ func upsertCatalogTrack(_ input: CatalogTrackInput) async throws -> String {
             updates["albumLower"]       = input.album.lowercased()
             updates["trackNumber"]      = input.trackNumber as Any
             updates["albumReleaseDate"] = input.albumReleaseDate as Any
+        }
+        // Fill empty metadata once Apple has it (a pre-release row has none of
+        // these). One-directional — a stored value is never overwritten.
+        if (existing.duration ?? 0) == 0, let d = input.duration, d > 0 { updates["duration"] = d }
+        if existing.albumReleaseDate == nil, let d = input.albumReleaseDate { updates["albumReleaseDate"] = d }
+        if existing.trackNumber == nil, let n = input.trackNumber { updates["trackNumber"] = n }
+        // A row ingested while Apple still listed the song as "Track 6" keeps
+        // that name for everyone until a real title replaces it. One-directional:
+        // only a placeholder is ever overwritten, never a real title.
+        if isPlaceholderTrackTitle(existing.title),
+           !input.title.isEmpty, !isPlaceholderTrackTitle(input.title) {
+            updates["title"]      = input.title
+            updates["titleLower"] = input.title.lowercased()
+            if let d = input.duration, d > 0 { updates["duration"] = d }
         }
         if !updates.isEmpty {
             updates["updatedAt"] = now
@@ -153,6 +185,8 @@ private func createCatalogRow(_ input: CatalogTrackInput, now: Double) async thr
         isrc:              input.isrc,
         trackNumber:       input.trackNumber,
         albumReleaseDate:  input.albumReleaseDate,
+        genres:            input.genres,
+        isExplicit:        input.isExplicit,
         appleMusicUri:     input.appleMusicUri,
         appleMusicTrackId: input.appleMusicTrackId,
         spotifyUri:        input.spotifyUri,
@@ -186,21 +220,25 @@ func ensureCatalogId(for song: Song) async throws -> String {
         duration:         song.duration,
         isrc:             song.isrc,
         trackNumber:      song.trackNumber,
-        albumReleaseDate: song.albumReleaseDate
+        albumReleaseDate: song.albumReleaseDate,
+        genres:           song.genres,
+        isExplicit:       song.isExplicit
     )
     switch song.sourceService {
     case .appleMusic:
         input = CatalogTrackInput(
             title: input.title, artist: input.artist, album: input.album, artwork: input.artwork,
             duration: input.duration, isrc: input.isrc, trackNumber: input.trackNumber,
-            albumReleaseDate: input.albumReleaseDate,
+            albumReleaseDate: input.albumReleaseDate, genres: input.genres,
+            isExplicit: input.isExplicit,
             appleMusicUri: song.uri, appleMusicTrackId: song.trackId
         )
     case .spotify:
         input = CatalogTrackInput(
             title: input.title, artist: input.artist, album: input.album, artwork: input.artwork,
             duration: input.duration, isrc: input.isrc, trackNumber: input.trackNumber,
-            albumReleaseDate: input.albumReleaseDate,
+            albumReleaseDate: input.albumReleaseDate, genres: input.genres,
+            isExplicit: input.isExplicit,
             spotifyUri: song.uri, spotifyTrackId: song.trackId
         )
     }

@@ -31,6 +31,13 @@ public struct Post: Codable, Identifiable, Hashable, Sendable {
     /// Repeat" section. See `syncRecentTracks`'s replay-detection logic.
     public var replayCount: Int
     public var isSpotlit: Bool
+    /// Overlaid from the shared catalog row — see `merged(withCatalog:)`.
+    /// Drives the album-level explicit mark on Home's feed-derived rails.
+    public var isExplicit: Bool
+    /// Genre tags, overlaid from the catalog row (empty until that row has
+    /// been backfilled). Used only for profile "taste match" — never stored on
+    /// the slim event doc.
+    public var genres: [String]
     public let geohash: String?
     public let createdAt: Double
     /// UID of the user who owns this track in their `recent_tracks` subcollection.
@@ -56,10 +63,12 @@ public struct Post: Codable, Identifiable, Hashable, Sendable {
         nods: Int = 0,
         replayCount: Int = 0,
         isSpotlit: Bool = false,
+        isExplicit: Bool = false,
         geohash: String? = nil,
         createdAt: Double,
         sourceUid: String? = nil,
-        trackId: String? = nil
+        trackId: String? = nil,
+        genres: [String] = []
     ) {
         self.id = id
         self.uid = uid
@@ -78,10 +87,12 @@ public struct Post: Codable, Identifiable, Hashable, Sendable {
         self.nods = nods
         self.replayCount = replayCount
         self.isSpotlit = isSpotlit
+        self.isExplicit = isExplicit
         self.geohash = geohash
         self.createdAt = createdAt
         self.sourceUid = sourceUid
         self.trackId = trackId
+        self.genres = genres
     }
 
     /// Tolerant decoder — **required**, not decoration.
@@ -117,10 +128,12 @@ public struct Post: Codable, Identifiable, Hashable, Sendable {
         nods            = (try? c.decode(Int.self, forKey: .nods)) ?? 0
         replayCount     = (try? c.decode(Int.self, forKey: .replayCount)) ?? 0
         isSpotlit       = (try? c.decode(Bool.self, forKey: .isSpotlit)) ?? false
+        isExplicit      = (try? c.decode(Bool.self, forKey: .isExplicit)) ?? false
         geohash         = try? c.decodeIfPresent(String.self, forKey: .geohash)
         createdAt       = (try? c.decode(Double.self, forKey: .createdAt)) ?? 0
         sourceUid       = try? c.decodeIfPresent(String.self, forKey: .sourceUid)
         trackId         = try? c.decodeIfPresent(String.self, forKey: .trackId)
+        genres          = (try? c.decode([String].self, forKey: .genres)) ?? []
     }
 
     /// Returns a copy with metadata taken from the catalog row (the source of
@@ -135,6 +148,8 @@ public struct Post: Codable, Identifiable, Hashable, Sendable {
         copy.artwork = catalog.artwork
         copy.uri     = catalog.appleMusicUri ?? uri
         copy.isrc    = catalog.isrc ?? isrc
+        copy.isExplicit = catalog.isExplicit
+        if !catalog.genres.isEmpty { copy.genres = catalog.genres }
         return copy
     }
 }

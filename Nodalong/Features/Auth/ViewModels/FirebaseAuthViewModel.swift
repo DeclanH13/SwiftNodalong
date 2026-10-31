@@ -51,6 +51,74 @@ final class FirebaseAuthViewModel {
 
     var atSpotlightLimit: Bool { todaySpotlitIds.count >= maxSpotlights }
 
+    /// Today's spotlights, as stored.
+    private var todaySpotlightTracks: [SpotlightTrack] {
+        let todayKey = dateKey(epochMs: Date().timeIntervalSince1970 * 1000)
+        return (profile?.spotlightTracks ?? []).filter { dateKey(epochMs: $0.spotlitAt) == todayKey }
+    }
+
+    /// Today's spotlight that is THIS song, if any — matched WITHOUT needing a
+    /// `catalogId`.
+    ///
+    /// A track started from Search, an album page or Top Songs comes straight
+    /// from Apple Music and has no `catalogId` (that is a Nodalong/Firestore
+    /// concept). The spotlight controls used to disable themselves for an empty
+    /// id, so most tracks you start yourself — including whatever is on the Now
+    /// Playing screen — could never be spotlit, and an already-spotlit one
+    /// showed as un-spotlit. Each spotlight stores its `uri`, title and artist,
+    /// so identity can be decided locally, with no network call.
+    func todaySpotlight(matching song: Song) -> SpotlightTrack? {
+        let id = song.catalogId ?? ""
+        let title = Self.spotlightKey(song.title)
+        let artist = primaryArtist(song.artist).lowercased()
+        return todaySpotlightTracks.first {
+            (!id.isEmpty && $0.trackId == id)
+                || (!song.uri.isEmpty && $0.uri == song.uri)
+                || (Self.spotlightKey($0.title) == title && primaryArtist($0.artist).lowercased() == artist)
+        }
+    }
+
+    private static func spotlightKey(_ title: String) -> String {
+        stripSearchNoise(title).lowercased().trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Whether the spotlight control for `song` should be enabled. Exactly two
+    /// things can stop a spotlight: it is already one of today's picks (in which
+    /// case the control REMOVES it), or the daily limit is reached.
+    func canSpotlight(_ song: Song) -> Bool {
+        todaySpotlight(matching: song) != nil || !atSpotlightLimit
+    }
+
+    /// Spotlights `song`, or removes it if it is already one of today's picks.
+    ///
+    /// A song with no `catalogId` gets one here, at tap time — the same thing
+    /// the Shelf heart does — because a spotlight keyed by `""` could never be
+    /// matched back to the track. Cheap on repeat: `ensureCatalogId` consults
+    /// `TrackCache` before it writes anything.
+    func toggleSpotlight(_ song: Song) async {
+        if let existing = todaySpotlight(matching: song) {
+            await removeFromSpotlight(trackId: existing.trackId)
+            return
+        }
+        guard canSpotlight(song) else { spotlightLimitReached = true; return }
+        // A double-tap during the catalog round trip must not add it twice.
+        let key = song.uri.isEmpty ? Self.spotlightKey(song.title) : song.uri
+        guard spotlightInFlight.insert(key).inserted else { return }
+        defer { spotlightInFlight.remove(key) }
+
+        var doc = LibraryTrackDoc.from(song: song)
+        if doc.catalogId.isEmpty {
+            guard let id = try? await ensureCatalogId(for: song) else {
+                authError = "Couldn't spotlight this track. Check your connection and try again."
+                return
+            }
+            doc = doc.withCatalogId(id)
+        }
+        await addToSpotlight(doc)
+    }
+
+    @ObservationIgnored private var spotlightInFlight = Set<String>()
+
     @ObservationIgnored private var listenerHandle: AuthStateDidChangeListenerHandle?
 
     var isAuthenticated: Bool { currentUser != nil && profile != nil }

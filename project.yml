@@ -33,23 +33,34 @@ targets:
       - path: Nodalong
         excludes:
           - "**/.gitkeep"
+      # Shared with the widget extension — see ListeningActivityAttributes.
+      - path: NodalongShared
     resources:
       - Nodalong/Resources/Assets.xcassets
       - Nodalong/Resources/LaunchScreen.storyboard
       - Nodalong/Resources/Fonts
       - path: Nodalong/GoogleService-Info.plist
         optional: true
+    entitlements:
+      path: Nodalong/Nodalong.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.bigdeccyh.nodalong
     info:
       path: Nodalong/Info.plist
       properties:
         CFBundleDisplayName: Nodalong
         CFBundleShortVersionString: "0.1.1"
-        CFBundleVersion: "4"
+        CFBundleVersion: "6"
         UILaunchStoryboardName: LaunchScreen
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UIBackgroundModes:
           - audio
+        NSSupportsLiveActivities: true
+        # Portrait only (iPhone-only app). Without this key iOS allows landscape.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
         NSLocationWhenInUseUsageDescription: Nodalong uses your approximate location to show music listeners near you.
         NSPhotoLibraryUsageDescription: Nodalong needs access to your photo library so you can choose a profile picture.
         NSAppleMusicUsageDescription: Nodalong uses Apple Music to play tracks and access your library.
@@ -86,3 +97,33 @@ targets:
         product: NodalongKit
       - package: Kingfisher
         product: Kingfisher
+      - target: NodalongWidgets
+        embed: true
+
+  NodalongWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NodalongWidgets
+      - path: NodalongShared
+    entitlements:
+      path: NodalongWidgets/NodalongWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.bigdeccyh.nodalong
+    info:
+      path: NodalongWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Nodalong
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "6"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bigdeccyh.nodalong.widgets
+        TARGETED_DEVICE_FAMILY: "1"
+        DEVELOPMENT_TEAM: BZWD55RJD7
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        SKIP_INSTALL: YES

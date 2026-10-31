@@ -28,38 +28,29 @@ enum AppChrome {
 
     /// Applied once at process launch, from `AppDelegate`.
     ///
-    /// This exists because the main app's own chrome setup lives in
-    /// `MainTabView.init()`, which only runs **after sign-in** — so the
-    /// pre-auth navigation stack (Sign In / Create Account / Reset password)
-    /// never received any of it, and its nav titles rendered in SF while the
-    /// screen beneath them was Quicksand.
-    ///
-    /// Deliberately configures a **transparent** nav background rather than
-    /// the opaque `bgBase` one `configureMainChrome()` uses: the auth screens
-    /// sit on `bgDeep`, and painting an opaque `bgBase` strip across their top
-    /// would read as a mismatched band. Title colour is `textOnAccent` for the
-    /// same reason — `bgDeep` is a mid-purple in both appearances, where the
-    /// default dark label colour only reaches ~2:1.
-    ///
-    /// `configureMainChrome()` overrides all of this once the user signs in;
-    /// appearance proxies apply to bars created after they're set, and the
-    /// tab bar's own bars are all created at that point.
+    /// This used to also configure a transparent nav-bar appearance for the
+    /// pre-auth stack (Sign In / Create Account / Reset password), whose
+    /// titles would otherwise have rendered in SF while the screen beneath
+    /// them was Quicksand. **That block is gone: those three screens no
+    /// longer have a navigation bar**, and neither does `SplashView` above
+    /// them, so nothing pre-auth can display one. `configureMainChrome()`
+    /// still configures the nav bar because the app's sheets — Add to
+    /// Playlist, Edit Profile, Queue, Start an LP, Add to Queue — kept
+    /// theirs.
     static func configureLaunchChrome() {
-        let appearance = UINavigationBarAppearance()
-        appearance.configureWithTransparentBackground()
-        let onAccent = UIColor(named: "textOnAccent") ?? .white
-        appearance.titleTextAttributes      = [.foregroundColor: onAccent, .font: navTitleFont]
-        appearance.largeTitleTextAttributes = [.foregroundColor: onAccent, .font: navLargeTitleFont]
-        UINavigationBar.appearance().standardAppearance   = appearance
-        UINavigationBar.appearance().scrollEdgeAppearance = appearance
-
         UITabBarItem.appearance().setTitleTextAttributes([.font: tabItemFont], for: .normal)
         UITabBarItem.appearance().setTitleTextAttributes([.font: tabItemFont], for: .selected)
     }
 
-    /// The authenticated app's chrome — opaque `bgBase` nav bar, brand tints,
-    /// and the window background. Called once per process from
+    /// The authenticated app's chrome — brand tints, the window background,
+    /// and the opaque `bgBase` nav bar. Called once per process from
     /// `MainTabView.init()`.
+    ///
+    /// The nav-bar half now only reaches the app's **sheets** (Add to
+    /// Playlist, Edit Profile, Queue, Start an LP, Add to Queue), which
+    /// deliberately kept their bars so Cancel/Done stays where the platform
+    /// puts it. Every pushed and tab-root screen hides its bar and renders a
+    /// `ScreenHeader` instead.
     ///
     /// `UIColor(named:)`, not `UIColor(Color.nodalong.X)` — the latter
     /// resolves the SwiftUI `Color` to a static snapshot at the moment this

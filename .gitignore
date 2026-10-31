@@ -36,3 +36,4 @@ Nodalong/GoogleService-Info*.plist
 .env
 .env.*
 service-account*.json
+.symbols/

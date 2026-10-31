@@ -249,7 +249,7 @@ final class ListeningPartyViewModel: ObservableObject {
 
     func addToQueue(_ song: Song) {
         guard let party, canAddToQueue, let me else { return }
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        Haptics.impact(.medium)
         Task {
             do {
                 try await addToPartyQueue(

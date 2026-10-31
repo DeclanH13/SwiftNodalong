@@ -3,13 +3,19 @@ import NodalongKit
 
 /// Search tab — find people on Nodalong, or music via Apple Music.
 ///
-/// Layout:
+/// Layout: one shared `ScrollView` for every state, so `searchControls`
+/// (the query field + filter row) is mounted exactly once — never inside
+/// the `if/else if` below it — and simply scrolls away as you scroll into
+/// whichever content is showing. See `body`'s doc comment for why that
+/// matters (keyboard focus safety) and `ScreenControls.swift` for why this
+/// app doesn't animate a header hiding on scroll at all.
+///
 /// 1. `searchFilterRow` — a single self-collapsing pill-tab row (see its doc
 ///    comment): `People | Music` in People mode, expanding in place to
 ///    `People | All | Artists | Albums | Songs` in Music mode.
-/// 2. While `query` is empty, `browseState` shows discovery content instead
-///    of a bare prompt — recent searches, genre tiles + popular albums
-///    (Music mode), or live-now + people-you-may-know (People mode).
+/// 2. While `query` is empty, `browseContent` shows discovery content
+///    instead of a bare prompt — recent searches, genre tiles + popular
+///    albums (Music mode), or live-now + people-you-may-know (People mode).
 /// 3. Once typing starts, results render per scope:
 ///     - Artists → horizontal carousel of circle cards
 ///     - Albums → horizontal carousel of album-art cards
@@ -17,6 +23,8 @@ import NodalongKit
 ///     - **All** stacks all three sections with mini-carousels above the list
 /// 4. People mode results are a vertical list of user rows with inline
 ///    follow toggles.
+/// 5. A genre tile tap shows `genreChartContent` instead — a genuinely
+///    genre-scoped songs chart, not a free-text search result.
 struct SearchView: View {
     @EnvironmentObject private var musicService:   AppleMusicService
     @EnvironmentObject private var spotifyService: SpotifyMusicService
@@ -29,20 +37,52 @@ struct SearchView: View {
     @EnvironmentObject private var router:         AppRouter
 
     @State private var isResolvingLiveNowUser = false
-    /// Backs the tap→open "zoom" transition on album tiles — the tapped
-    /// tile's artwork visually expands into the destination's header instead
-    /// of a plain slide, so the ~500ms track fetch (already near the network
-    /// floor — nothing left to shave there) happens behind motion instead of
-    /// a bare wait. Must live here: `.navigationTransition(.zoom(...))` and
-    /// `.matchedTransitionSource(...)` only work across a shared namespace
-    /// whose ancestor owns the `NavigationStack` both ends sit in.
-    @Namespace private var zoomNamespace
-
+    /// Set by a re-tap of the Search tab while already at the root.
+    @FocusState private var queryFocused: Bool
+    @EnvironmentObject private var tasteStore: TasteOverridesStore
     /// Whichever backend is actually connected — search must route here,
     /// not hardcode Apple Music, or a Spotify-only account gets zero
     /// results no matter what they type.
     private var activeService: any MusicService {
         activeMusicService(playerVM: playerVM, apple: musicService, spotify: spotifyService)
+    }
+
+    private var topHitIDs: (artist: ArtistResult?, albums: [AlbumResult]) {
+        var artist: ArtistResult?
+        var albums: [AlbumResult] = []
+        for hit in searchVM.rankedHits.prefix(15) {
+            switch hit {
+            case .artist(let a) where artist == nil: artist = a
+            case .album(let a) where albums.count < 2: albums.append(a)
+            default: break
+            }
+        }
+        return (artist, albums)
+    }
+
+    private var topHitKey: String {
+        let t = topHitIDs
+        return ([t.artist?.id ?? ""] + t.albums.map(\.id)).joined(separator: "|")
+    }
+
+    private func prefetchTopHits() async {
+        guard playerVM.activeService == .appleMusic, searchVM.scope == .all else { return }
+        let t = topHitIDs
+        if let a = t.artist { await CatalogPrefetch.artist(a, service: musicService, settle: 0) }
+        for a in t.albums {
+            guard !Task.isCancelled else { return }
+            await CatalogPrefetch.album(id: a.id, name: a.name, artwork: a.artwork, releaseDate: a.releaseDate,
+                                        artist: a.artistName, service: musicService, settle: 0)
+        }
+    }
+
+    /// The first MusicKit catalog call in a session pays token/connection
+    /// setup. Spend it on a throwaway request while the user is still typing.
+    private static var didWarmSearch = false
+    private func warmSearchConnection() async {
+        guard !Self.didWarmSearch, activeService.isAuthenticated else { return }
+        Self.didWarmSearch = true
+        _ = try? await activeService.searchAll("a", maxPerType: 1)
     }
 
     /// `true` when no section has anything to render. Drives the "No results"
@@ -54,42 +94,108 @@ struct SearchView: View {
         || !searchVM.results.tracks.isEmpty
     }
 
+    /// Discriminates which branch is showing, purely to know when to snap
+    /// the shared scroll view back to the top. Each state used to be its
+    /// own fresh `ScrollView` (so it naturally started scrolled to top);
+    /// folding them into one persistent `ScrollView` — to keep the query
+    /// field's identity stable across state changes, see `body`'s doc
+    /// comment — means that has to be done explicitly instead.
+    private var searchStateKey: String {
+        if let genre = searchVM.genreChartName { return "genre:\(genre)" }
+        if searchVM.isSearching && !hasAnyResults { return "loading" }
+        if searchVM.query.count >= 2 && !hasAnyResults { return "noResults" }
+        if searchVM.query.count < 2 { return "browse:\(searchVM.mode.rawValue)" }
+        return "results:\(searchVM.mode.rawValue):\(searchVM.scope.rawValue)"
+    }
+
+    /// Avatar row + query field + filter row, bundled as ONE always-
+    /// mounted, non-conditional view. It must never sit inside the
+    /// `if/else if` below — if it did, the `TextField` would be torn down
+    /// and recreated the instant typing crosses the 2-character threshold
+    /// into results, risking a keyboard/focus glitch on exactly the
+    /// transition this screen exists to make feel smooth. Keeping it
+    /// outside the switch means its view identity never changes; scrolling
+    /// the shared `ScrollView` is what makes it "float away" as you scroll
+    /// into content — no animation, no hide-on-scroll logic, the same
+    /// zero-cost pattern `ScreenTitle`/`ScreenControls` already use
+    /// elsewhere.
+    ///
+    /// `ProfileAvatarRow()` is INLINE content here, its own row above the
+    /// rest — not a `.screenControls(trailing:)` floating overlay, which
+    /// was tried first and was a real bug: a fixed-position overlay
+    /// doesn't know this content now scrolls, so at some scroll offsets it
+    /// sat on top of the query field/filter pills instead of beside them.
+    /// Matches Home/Feed/NearMe's own convention exactly for the same
+    /// reason — reserving real space is the only version of this that
+    /// structurally cannot overlap anything.
+    private var searchControls: some View {
+        VStack(spacing: 0) {
+            ProfileAvatarRow()
+            queryField
+            searchFilterRow
+        }
+    }
+
     var body: some View {
         NavigationStack(path: $router.searchPath) {
-            ZStack {
-                Color.nodalong.bgBase
-                    .ignoresSafeArea()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 0) {
+                        searchControls
+                            .id("top")
 
-                VStack(spacing: 0) {
-                    searchFilterRow
+                        // The big blocking spinner is only for the genuinely
+                        // empty case (a fresh search, or one that's cleared
+                        // everything). Once there ARE results on screen, a
+                        // refinement (typing further, switching scope) keeps
+                        // them visible — `resultsContent` itself dims +
+                        // overlays a small spinner while `isSearching` is
+                        // true. Without this split, every pause in typing
+                        // wiped the whole list to a full-screen spinner and
+                        // repopulated it a few hundred ms later — visible
+                        // flicker on every keystroke, which is most of what
+                        // "search doesn't feel responsive" was actually
+                        // describing.
+                        Group {
+                            if let genre = searchVM.genreChartName {
+                                genreChartContent(genre: genre)
+                            } else if searchVM.isSearching && !hasAnyResults {
+                                loadingContent
+                            } else if searchVM.query.count >= 2 && !hasAnyResults {
+                                noResultsContent
+                            } else if searchVM.query.count < 2 {
+                                browseContent
+                            } else {
+                                resultsContent
+                            }
+                        }
 
-                    // The big blocking spinner is only for the genuinely
-                    // empty case (a fresh search, or one that's cleared
-                    // everything). Once there ARE results on screen, a
-                    // refinement (typing further, switching scope) keeps
-                    // them visible — `resultsScroll` itself dims + overlays
-                    // a small spinner while `isSearching` is true. Without
-                    // this split, every pause in typing wiped the whole
-                    // list to a full-screen spinner and repopulated it a
-                    // few hundred ms later — visible flicker on every
-                    // keystroke, which is most of what "search doesn't feel
-                    // responsive" was actually describing.
-                    Group {
-                        if searchVM.isSearching && !hasAnyResults {
-                            ProgressView()
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        } else if searchVM.query.count >= 2 && !hasAnyResults {
-                            noResultsState
-                        } else if searchVM.query.count < 2 {
-                            browseState
-                        } else {
-                            resultsScroll
+                        // Breathing room between the last result and the
+                        // mini player — one shared spacer now that every
+                        // state lives in the same scroll content, instead
+                        // of a copy per branch.
+                        if playerVM.nowPlaying != nil {
+                            Color.clear.frame(height: 70)
                         }
                     }
                 }
+                .screenBackground()
+                .onChange(of: searchStateKey) {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        proxy.scrollTo("top", anchor: .top)
+                    }
+                }
+                // Re-tap of the Search tab while already on its root: back to
+                // the top AND into the field, so a second tap means "I want to
+                // search" rather than just moving the page.
+                .onChange(of: router.scrollToTopRequests[.search]) {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        proxy.scrollTo("top", anchor: .top)
+                    }
+                    queryFocused = true
+                }
             }
-            .navigationTitle("Search")
-            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .navigationBar)
             // Both destinations a follow-list flow needs, registered together on
             // every stack that can host it.
             //
@@ -112,38 +218,37 @@ struct SearchView: View {
             .navigationDestination(for: UserProfile.self) {
                 UserProfileView(user: $0)
             }
-            .navigationDestination(for: ArtistResult.self) { artist in
-                ArtistDetailSearchView(artist: artist)
-                    .navigationTransition(.zoom(sourceID: artist.key, in: zoomNamespace))
-            }
-            .navigationDestination(for: AlbumResult.self) { album in
-                AlbumDetailSearchView(album: album)
-                    .navigationTransition(.zoom(sourceID: album.key, in: zoomNamespace))
-            }
+            .navigationDestination(for: ArtistResult.self) { ArtistDetailSearchView(artist: $0) }
+            .navigationDestination(for: AlbumResult.self) { AlbumDetailSearchView(album: $0) }
             .navigationDestination(for: Playlist.self) { PlaylistDetailView(playlist: $0) }
             // Landed here from `router.dismissThenPush` — NowPlayingView's
             // artist/album tap, or PartyView's — since a push always targets
             // whichever tab happens to be selected, not necessarily this one.
             .navigationDestination(for: PendingArtistResolve.self) { pending in
-                ResolvingArtistsView(name: pending.artist) {
+                ResolvingArtistsView(name: pending.artist, cached: cachedPendingArtists(pending, playerVM: playerVM)) {
                     await resolvePendingArtists(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .navigationDestination(for: PendingAlbumResolve.self) { pending in
-                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork) {
+                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork,
+                                   cached: cachedPendingAlbum(pending, playerVM: playerVM)) {
                     await resolvePendingAlbum(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
+            .profileEntryPoint()
+            // `.enablesInteractiveSwipeBack()` only — the avatar lives in
+            // `searchControls` as inline content now, not a floating
+            // overlay (see that property's doc comment for why the
+            // overlay version was a real bug). `showsBack: false` — a tab
+            // root has nothing to pop to.
+            .screenControls(showsBack: false)
         }
-        .searchable(
-            text: $searchVM.query,
-            placement: .navigationBarDrawer(displayMode: .always),
-            prompt: searchVM.mode == .people
-                ? "Find people"
-                : "Artists, albums, songs"
-        )
         .onChange(of: searchVM.query) {
+            KeyboardLatencyProbe.firstKey()
             searchVM.search(via: activeService)
+        }
+        .onChange(of: queryFocused) { _, focused in
+            if focused { KeyboardLatencyProbe.focused() }
         }
         .onChange(of: searchVM.mode) {
             searchVM.search(via: activeService, debounce: false)
@@ -151,8 +256,25 @@ struct SearchView: View {
         .onChange(of: searchVM.scope) {
             searchVM.search(via: activeService, debounce: false)
         }
+        // Top hit: warm the first ranked artist and first two albums the moment
+        // results land, with no settle delay — they're what gets tapped. Keyed
+        // on the ids so a newer query cancels a stale warm.
+        .task(id: topHitKey) { await prefetchTopHits() }
+        // Feed what the user listens to into ranking (breaks ties only).
+        .onAppear {
+            searchVM.taste = libraryVM.tasteWeights.applying(tasteStore.overrides)
+            searchVM.localArtistCandidates = libraryVM.artistEntries.map(\.name)
+        }
+        .onChange(of: libraryVM.artistEntries.count) {
+            searchVM.localArtistCandidates = libraryVM.artistEntries.map(\.name)
+        }
+        .onChange(of: libraryVM.tasteWeights) { _, new in searchVM.taste = new.applying(tasteStore.overrides) }
+        .onChange(of: tasteStore.overrides) { _, new in searchVM.taste = libraryVM.tasteWeights.applying(new) }
+        .enablesInteractiveSwipeBack()
         .task {
             diagLog("SearchView: .task fired")
+            KeyboardLatencyProbe.searchOpened()
+            Task { await warmSearchConnection() }
             guard let uid = authVM.currentUser?.uid else { return }
             searchVM.loadRecentSearches(uid: uid)
             // Independent (follow graph vs. personal library) — no reason to
@@ -167,37 +289,15 @@ struct SearchView: View {
             // run any earlier than the line above.
             await searchVM.loadBrowseContent(uid: uid, followingUids: Array(searchVM.followingUids), musicService: musicService)
         }
-        // Prefetch — while the user is browsing results (not yet tapped),
-        // warm `MusicDetailCache` for what's currently on screen. Reuses the
-        // EXACT closures `ArtistDetailSearchView`/`AlbumDetailSearchView`
-        // already call on their own `.task`, so a real tap either lands on a
-        // completed cache hit or joins an already-in-flight fetch instead of
-        // starting cold — this is the standard "prefetch on browse, not on
-        // tap" trick (the same one table/collection view prefetching APIs
-        // exist for). Bounded to the first 6 of each — what's actually
-        // visible without scrolling, not the full result set.
-        .task(id: searchVM.results.artists.map(\.id) + searchVM.results.albums.map(\.id)) {
-            guard playerVM.activeService == .appleMusic else { return }
-            for artist in searchVM.results.artists.prefix(6) {
-                let artistId = artist.id
-                Task {
-                    _ = await MusicDetailCache.shared.core(artistId: artistId) {
-                        guard let c = try? await musicService.getArtistCore(artistId: artistId) else { return nil }
-                        return ArtistCoreDetails(albums: c.albums, topTracks: c.topTracks)
-                    }
-                }
-            }
-            for album in searchVM.results.albums.prefix(6) {
-                let (albumId, albumName, artwork) = (album.id, album.name, album.artwork)
-                Task {
-                    _ = await MusicDetailCache.shared.tracks(albumId: albumId) {
-                        (try? await musicService.getAlbumTracks(albumId: albumId, albumName: albumName, artwork: artwork)) ?? []
-                    }
-                }
-            }
-        }
-
-        // Same browse-time prefetch, for PEOPLE. Warms the exact
+        // NOTE: the music half of this screen's prefetch has moved INTO
+        // `ArtistsCarousel`/`AlbumsCarousel` as a per-tile `.task` — it is
+        // visibility-driven there, so it covers results past the sixth
+        // (which this bounded version left cold) and skips ones never
+        // scrolled to. Only the PEOPLE prefetch stays screen-level, because
+        // its cap is doing real work: each bundle is ~5 billed Firestore
+        // reads, where a MusicKit catalog request is free.
+        //
+        // Browse-time prefetch, for PEOPLE. Warms the exact
         // `SocialCache` bundle `UserProfileView` reads, so tapping a result
         // lands on a complete profile — spotlight carousel and recents
         // included — instead of watching five fetches arrive.
@@ -210,6 +310,53 @@ struct SearchView: View {
             SocialCache.shared.prefetch(uids: searchVM.userResults.map(\.uid), viewerUid: myUid)
             SocialCache.shared.prefetch(uids: searchVM.suggestedUsers.map(\.uid), viewerUid: myUid)
         }
+    }
+
+    /// Search's query field, in-content rather than `.searchable`.
+    ///
+    /// `.searchable` renders inside the navigation bar, and the nav bar is
+    /// gone app-wide — so unlike Shelf's filter (which was relocated to stop
+    /// the bar changing height across a push) this one simply has nowhere
+    /// else to live. Same binding and same `.onChange` search triggers.
+    ///
+    /// Frosted (`.ultraThinMaterial`) rather than a solid `bgCard` fill — it
+    /// now sits directly on the animated mesh (see `body`) as part of the
+    /// scrollable content, and the frosted look is what actually reads as
+    /// "floating over" the mesh rather than an opaque bar sitting in front
+    /// of it. Same material `HeaderGlyph` uses for the same reason.
+    private var queryField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(Font.nodalong.subheadline)
+                .foregroundStyle(Color.nodalong.textSecondary)
+            TextField(searchVM.mode == .people ? "Find people" : "Artists, albums, songs",
+                      text: $searchVM.query)
+                .textFieldStyle(.plain)
+                .font(Font.nodalong.subheadline)
+                .foregroundStyle(Color.nodalong.textPrimary)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .submitLabel(.search)
+                .focused($queryFocused)
+            if !searchVM.query.isEmpty {
+                Button {
+                    searchVM.query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(Font.nodalong.subheadline)
+                        .foregroundStyle(Color.nodalong.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 8)
     }
 
     // MARK: - Filter row
@@ -267,7 +414,7 @@ struct SearchView: View {
         .transition(.opacity)
     }
 
-    // MARK: - Empty / prompt states
+    // MARK: - Empty / prompt / loading states
 
     /// Bare fallback for when there's genuinely nothing to show yet — no
     /// recent searches, browse content still loading or empty, and (People
@@ -280,10 +427,16 @@ struct SearchView: View {
             Text(searchVM.mode == .people ? "Find people on Nodalong" : "Find music in Apple Music")
                 .font(Font.nodalong.subheadline).foregroundStyle(Color.nodalong.textSecondary)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 60)
     }
 
-    private var noResultsState: some View {
+    /// Content, not its own scroll region — see `body`'s doc comment on why
+    /// every state now shares one `ScrollView`. `maxHeight: .infinity` used
+    /// to center this inside a dedicated full-screen sibling; inside shared
+    /// scroll content that would just claim unbounded height, so it's fixed
+    /// top padding instead.
+    private var noResultsContent: some View {
         VStack(spacing: 12) {
             Image(systemName: Icons.searchOutline)
                 .font(Font.nodalong.largeTitle).foregroundStyle(Color.nodalong.textSecondary)
@@ -300,25 +453,30 @@ struct SearchView: View {
                     .padding(.horizontal, 32)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 60)
+    }
+
+    /// Shown while `isSearching` and nothing has landed yet. Same reasoning
+    /// as `noResultsContent` on why this is top-padded rather than
+    /// vertically centered now that it's shared scroll content.
+    private var loadingContent: some View {
+        ProgressView()
+            .frame(maxWidth: .infinity)
+            .padding(.top, 60)
     }
 
     // MARK: - Browse state (shown while query is empty)
 
     @ViewBuilder
-    private var browseState: some View {
-        ScrollView {
-            VStack(spacing: 24) {
-                switch searchVM.mode {
-                case .people: peopleBrowseState
-                case .music:  musicBrowseState
-                }
-                if playerVM.nowPlaying != nil {
-                    Color.clear.frame(height: 70)
-                }
+    private var browseContent: some View {
+        VStack(spacing: 24) {
+            switch searchVM.mode {
+            case .people: peopleBrowseState
+            case .music:  musicBrowseState
             }
-            .padding(.vertical, 12)
         }
+        .padding(.vertical, 12)
     }
 
     @ViewBuilder
@@ -334,7 +492,7 @@ struct SearchView: View {
             }
             if !searchVM.popularAlbums.isEmpty {
                 SearchSection(title: "Popular albums") {
-                    AlbumsCarousel(albums: searchVM.popularAlbums, namespace: zoomNamespace)
+                    AlbumsCarousel(albums: searchVM.popularAlbums)
                 }
             }
         }
@@ -424,28 +582,28 @@ struct SearchView: View {
 
     // MARK: Browse by mood/genre
 
-    /// Static shortcuts into the existing search pipeline — tapping a tile
-    /// sets `query`/`mode`/`scope` and runs a normal search, exactly as if
-    /// the user had typed the genre name. Deliberately not backed by a
-    /// dedicated genre-chart MusicKit request; this is a convenience
-    /// front-end onto search, not a second search mechanism.
+    /// All six of these are real, resolvable Apple Music top-level genres —
+    /// unlike the previous "Chill"/"Workout" pair, which were moods, not
+    /// genres, and silently returned nothing from a genre-scoped request.
+    /// Tapping a tile calls `SearchViewModel.showGenreChart`, a genuinely
+    /// genre-filtered chart request — NOT a free-text search of the genre's
+    /// name (that was the bug: searching the literal word "Rock" is a
+    /// keyword match with no genre awareness at all, and could surface
+    /// anything popular, e.g. a top-charting pop artist).
     private static let genreTiles: [(name: String, color: Color)] = [
-        ("Pop",     Color.nodalong.purpleAccent),
-        ("Hip-hop", Color.nodalong.bgElevated),
-        ("Chill",   Color.nodalong.gold),
-        ("Workout", Color.nodalong.error),
-        ("R&B",     Color.nodalong.bgElevated),
-        ("Rock",    Color.nodalong.purpleAccent),
+        ("Pop",        Color.nodalong.purpleAccent),
+        ("Hip-hop",    Color.nodalong.bgElevated),
+        ("Electronic", Color.nodalong.gold),
+        ("Country",    Color.nodalong.error),
+        ("R&B",        Color.nodalong.bgElevated),
+        ("Rock",       Color.nodalong.purpleAccent),
     ]
 
     private var genreBrowseGrid: some View {
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
             ForEach(Self.genreTiles, id: \.name) { tile in
                 Button {
-                    searchVM.mode = .music
-                    searchVM.scope = .all
-                    searchVM.query = tile.name
-                    searchVM.search(via: activeService, debounce: false)
+                    searchVM.showGenreChart(tile.name, musicService: musicService)
                 } label: {
                     Text(tile.name)
                         .font(Font.nodalong.subheadlineMedium)
@@ -497,8 +655,8 @@ struct SearchView: View {
         guard !isResolvingLiveNowUser else { return }
         isResolvingLiveNowUser = true
         defer { isResolvingLiveNowUser = false }
-        if let profile = try? await getUserProfile(uid: entry.uid) {
-            router.searchPath.append(profile)
+        if let profile = await profileForNavigation(uid: entry.uid, viewerUid: authVM.currentUser?.uid) {
+            router.push(profile, onto: .search)
         }
     }
 
@@ -508,7 +666,7 @@ struct SearchView: View {
         VStack(spacing: 0) {
             ForEach(searchVM.suggestedUsers) { user in
                 Button {
-                    router.searchPath.append(user)
+                    router.push(user, onto: .search)
                 } label: {
                     HStack(spacing: 12) {
                         AvatarView(emoji: user.avatarEmoji, colorHex: user.avatarColor, size: 36)
@@ -544,29 +702,23 @@ struct SearchView: View {
 
     // MARK: - Results
 
+    /// Content, not its own scroll region — `.screenBackground()` is now
+    /// applied once, at the shared `ScrollView` in `body`; applying it here
+    /// too would run a second independent animated mesh, pure waste.
     @ViewBuilder
-    private var resultsScroll: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                switch searchVM.mode {
-                case .people: peopleResults
-                case .music:  musicResults
-                }
-
-                // Music access notice — only shown if relevant.
-                if searchVM.mode == .music && !activeService.isAuthenticated {
-                    musicAccessNotice
-                }
-
-                // Breathing room between the last result and the mini player.
-                // Matches the FeedView pattern — only injected when playing.
-                if playerVM.nowPlaying != nil {
-                    Color.clear.frame(height: 70)
-                }
+    private var resultsContent: some View {
+        VStack(spacing: 16) {
+            switch searchVM.mode {
+            case .people: peopleResults
+            case .music:  musicResults
             }
-            .padding(.vertical, 12)
+
+            // Music access notice — only shown if relevant.
+            if searchVM.mode == .music && !activeService.isAuthenticated {
+                musicAccessNotice
+            }
         }
-        .background(Color.nodalong.bgBase)
+        .padding(.vertical, 12)
         // Dim + a small spinner while a refinement is in flight, instead of
         // the caller replacing this whole view with a blocking spinner —
         // keeps the last-known-good results on screen (they may briefly be
@@ -630,57 +782,172 @@ struct SearchView: View {
 
     @ViewBuilder
     private var musicResults: some View {
+        if searchVM.scope == .all {
+            rankedList
+        } else {
+            scopedResults
+        }
+    }
+
+    @ViewBuilder
+    private var scopedResults: some View {
         VStack(spacing: 24) {
             if !searchVM.results.artists.isEmpty {
                 SearchSection(title: "Artists") {
-                    ArtistsCarousel(artists: searchVM.results.artists, namespace: zoomNamespace, onSelect: { artist in
+                    ArtistsCarousel(artists: searchVM.results.artists, onSelect: { artist in
                         recordRecent(kind: .artist, displayName: artist.name, queryText: artist.name)
                     })
                 }
             }
             if !searchVM.results.albums.isEmpty {
                 SearchSection(title: "Albums") {
-                    AlbumsCarousel(albums: searchVM.results.albums, namespace: zoomNamespace, onSelect: { album in
+                    AlbumsCarousel(albums: searchVM.results.albums, onSelect: { album in
                         recordRecent(kind: .album, displayName: album.name, queryText: "\(album.name) \(album.artistName)")
                     })
                 }
             }
             if !searchVM.results.tracks.isEmpty {
                 SearchSection(title: "Songs") {
-                    SongsList(
-                        tracks: searchVM.results.tracks,
-                        isInLibrary: { libraryVM.isInLibrary(catalogId: $0.catalogId, uri: $0.uri) },
-                        onPlay: { track in
-                            guard activeService.isAuthenticated else { return }
-                            recordRecent(kind: .track, displayName: track.title, queryText: "\(track.title) \(track.artist)")
-                            Task { await playerVM.play(.from(searchItem: track)) }
-                        },
-                        onLike: { track in
-                            guard let uid = authVM.currentUser?.uid else { return }
-                            let doc = LibraryTrackDoc(
-                                catalogId:        track.catalogId ?? "",
-                                title:            track.title,
-                                artist:           track.artist,
-                                album:            track.album,
-                                artwork:          track.artwork,
-                                uri:              track.uri,
-                                sourceService:    track.sourceService,
-                                isrc:             track.isrc,
-                                duration:         track.duration,
-                                trackNumber:      track.trackNumber,
-                                albumReleaseDate: track.albumReleaseDate,
-                                savedAt:          Date().timeIntervalSince1970 * 1000
-                            )
-                            Task { await libraryVM.toggleLibrary(uid: uid, track: doc) }
-                        },
-                        onAddToQueue: { track in
-                            guard activeService.isAuthenticated else { return }
-                            playerVM.addToQueue(.from(searchItem: track))
-                        }
-                    )
+                    songsSection(searchVM.results.tracks)
                 }
             }
         }
+    }
+
+    /// Shared `SongsList` configuration — used by `musicResults`'s Songs
+    /// section and by `genreChartContent`, so there's one copy of the
+    /// like/queue/play wiring instead of two. `recordsHistory` is `false`
+    /// for a genre chart tap: it isn't something the user typed, so it
+    /// shouldn't be recorded as a recent search.
+    private func songsSection(_ tracks: [SearchItem], recordsHistory: Bool = true) -> some View {
+        SongsList(
+            tracks: tracks,
+            isInLibrary: { libraryVM.isInLibrary(catalogId: $0.catalogId, uri: $0.uri) },
+            onPlay:       { playTrack($0, recordsHistory: recordsHistory) },
+            onLike:       { likeTrack($0) },
+            onAddToQueue: { queueTrack($0) }
+        )
+    }
+
+    private func playTrack(_ track: SearchItem, recordsHistory: Bool = true) {
+        guard activeService.isAuthenticated else { return }
+        if recordsHistory {
+            recordRecent(kind: .track, displayName: track.title, queryText: "\(track.title) \(track.artist)")
+        }
+        Task { await playerVM.play(.from(searchItem: track)) }
+    }
+
+    private func likeTrack(_ track: SearchItem) {
+        guard let uid = authVM.currentUser?.uid else { return }
+        let doc = LibraryTrackDoc(
+            catalogId:        track.catalogId ?? "",
+            title:            track.title,
+            artist:           track.artist,
+            album:            track.album,
+            artwork:          track.artwork,
+            uri:              track.uri,
+            sourceService:    track.sourceService,
+            isrc:             track.isrc,
+            duration:         track.duration,
+            trackNumber:      track.trackNumber,
+            albumReleaseDate: track.albumReleaseDate,
+            savedAt:          Date().timeIntervalSince1970 * 1000
+        )
+        Task { await libraryVM.toggleLibrary(uid: uid, track: doc) }
+    }
+
+    private func queueTrack(_ track: SearchItem) {
+        guard activeService.isAuthenticated else { return }
+        playerVM.addToQueue(.from(searchItem: track))
+    }
+
+    /// One list for All: songs, artists and albums ranked together by word
+    /// match (see `rankSearchHits`), so the thing you typed is on top
+    /// whichever kind it is.
+    private var rankedList: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(searchVM.rankedHits.prefix(30))) { hit in
+                Group {
+                    switch hit {
+                    case .track(let track):
+                        TrackSearchRow(
+                            track:        track,
+                            isLiked:      libraryVM.isInLibrary(catalogId: track.catalogId, uri: track.uri),
+                            onPlay:       { playTrack(track) },
+                            onLike:       { likeTrack(track) },
+                            onAddToQueue: { queueTrack(track) }
+                        )
+                    case .artist(let artist):
+                        NavigationLink(value: artist) {
+                            HitRow(artwork: artist.imageUrl, circular: true, isAlbum: false,
+                                   title: artist.name, subtitle: "Artist", explicit: false)
+                        }
+                        .buttonStyle(.plain)
+                        // Per-row warm, same as the old carousel tiles: a row that
+                        // lingers on screen gets its page prefetched (0.4s settle),
+                        // one flicked past costs nothing.
+                        .task(id: artist.id, priority: .utility) {
+                            guard playerVM.activeService == .appleMusic else { return }
+                            await CatalogPrefetch.artist(artist, service: musicService)
+                        }
+                        .simultaneousGesture(TapGesture().onEnded {
+                            recordRecent(kind: .artist, displayName: artist.name, queryText: artist.name)
+                        })
+                    case .album(let album):
+                        NavigationLink(value: album) {
+                            HitRow(artwork: album.artwork, circular: false, isAlbum: true,
+                                   title: album.name, subtitle: "Album · \(album.artistName)", explicit: album.isExplicit)
+                        }
+                        .buttonStyle(.plain)
+                        .task(id: album.id, priority: .utility) {
+                            guard playerVM.activeService == .appleMusic else { return }
+                            await CatalogPrefetch.album(id: album.id, name: album.name, artwork: album.artwork,
+                                                        releaseDate: album.releaseDate, artist: album.artistName,
+                                                        service: musicService)
+                        }
+                        .simultaneousGesture(TapGesture().onEnded {
+                            recordRecent(kind: .album, displayName: album.name, queryText: "\(album.name) \(album.artistName)")
+                        })
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+        }
+        .background(Color.nodalong.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: Genre chart (genre-tile tap)
+
+    /// Shown instead of the normal browse/results states while
+    /// `searchVM.genreChartName` is set — a genuinely genre-scoped songs
+    /// chart, not a free-text search result.
+    @ViewBuilder
+    private func genreChartContent(genre: String) -> some View {
+        VStack(spacing: 16) {
+            HStack {
+                Text(genre)
+                    .font(Font.nodalong.headline)
+                    .foregroundStyle(Color.nodalong.textPrimary)
+                Spacer()
+                Button("Done") { searchVM.exitGenreChart() }
+                    .font(Font.nodalong.captionSemibold)
+                    .foregroundStyle(Color.nodalong.purpleAccent)
+            }
+            .padding(.horizontal, 16)
+
+            if searchVM.genreChartTracks.isEmpty {
+                Text("No \(genre) chart available right now")
+                    .font(Font.nodalong.subheadline)
+                    .foregroundStyle(Color.nodalong.textSecondary)
+                    .padding(.top, 40)
+            } else {
+                songsSection(searchVM.genreChartTracks, recordsHistory: false)
+            }
+        }
+        .padding(.vertical, 12)
     }
 
     // MARK: Music-not-connected notice (footer)
@@ -760,27 +1027,29 @@ private struct SearchSection<Content: View>: View {
 
 private struct ArtistsCarousel: View {
     let artists: [ArtistResult]
-    var namespace: Namespace.ID? = nil
     var onSelect: ((ArtistResult) -> Void)? = nil
+    @EnvironmentObject private var musicService: AppleMusicService
+    @EnvironmentObject private var playerVM:     PlayerViewModel
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 16) {
                 ForEach(artists) { artist in
-                    Group {
-                        if let namespace {
-                            NavigationLink(value: artist) {
-                                ArtistCard(artist: artist)
-                            }
-                            .matchedTransitionSource(id: artist.key, in: namespace)
-                        } else {
-                            NavigationLink(value: artist) {
-                                ArtistCard(artist: artist)
-                            }
-                        }
+                    NavigationLink(value: artist) {
+                        ArtistCard(artist: artist)
                     }
                     .buttonStyle(.plain)
                     .simultaneousGesture(TapGesture().onEnded { onSelect?(artist) })
+                    // Per-TILE prefetch, not a screen-level `prefix(6)`.
+                    // Inside a `LazyHStack` this only runs for cells the
+                    // stack actually builds and is cancelled on scroll-away,
+                    // so it covers every artist the user can see — including
+                    // the ones past the sixth, which the old bounded version
+                    // left cold — while costing nothing for tiles flicked past.
+                    .task(id: artist.id, priority: .utility) {
+                        guard playerVM.activeService == .appleMusic else { return }
+                        await CatalogPrefetch.artist(artist, service: musicService)
+                    }
                 }
             }
             .padding(12)
@@ -815,33 +1084,30 @@ private struct ArtistCard: View {
 
 struct AlbumsCarousel: View {
     let albums: [AlbumResult]
-    /// The tap→open zoom transition's shared namespace — must come from
-    /// whichever screen owns the `NavigationStack` this carousel is pushed
-    /// within (see `SearchView.zoomNamespace`'s doc comment). Optional so
-    /// call sites that haven't opted in yet (none currently) still compile;
-    /// every carousel that pushes into an `AlbumResult` destination should
-    /// pass one.
-    var namespace: Namespace.ID? = nil
     var onSelect: ((AlbumResult) -> Void)? = nil
+    @EnvironmentObject private var musicService: AppleMusicService
+    @EnvironmentObject private var playerVM:     PlayerViewModel
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(albums) { album in
-                    Group {
-                        if let namespace {
-                            NavigationLink(value: album) {
-                                AlbumCard(album: album)
-                            }
-                            .matchedTransitionSource(id: album.key, in: namespace)
-                        } else {
-                            NavigationLink(value: album) {
-                                AlbumCard(album: album)
-                            }
-                        }
+                    NavigationLink(value: album) {
+                        AlbumCard(album: album)
                     }
                     .buttonStyle(.plain)
                     .simultaneousGesture(TapGesture().onEnded { onSelect?(album) })
+                    // Per-tile prefetch — see `ArtistsCarousel`'s equivalent.
+                    // This one component is used by Search results, Search's
+                    // Popular Albums browse rail, Home's Recommended for You,
+                    // and the "See All" screen, so warming here covers four
+                    // surfaces at once (two of which had no prefetch at all).
+                    .task(id: album.id, priority: .utility) {
+                        guard playerVM.activeService == .appleMusic else { return }
+                        await CatalogPrefetch.album(id: album.id, name: album.name,
+                                                    artwork: album.artwork, releaseDate: album.releaseDate,
+                                                    artist: album.artistName, service: musicService)
+                    }
                 }
             }
             .padding(12)
@@ -859,8 +1125,10 @@ struct AlbumCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ArtworkThumbnail(url: album.artwork, size: 140, isAlbum: true)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
-            MarqueeText(text: album.name, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+            HStack(spacing: 4) {
+                MarqueeText(text: album.name, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+                if album.isExplicit { ExplicitBadge() }
+            }
             Text(album.artistName)
                 .font(Font.nodalong.caption2)
                 .foregroundStyle(Color.nodalong.textSecondary)
@@ -941,6 +1209,44 @@ private struct UserSearchRow: View {
     }
 }
 
+/// Artist / album row in the unified list — same shape as a song row, with a
+/// circular thumbnail for artists and the vinyl treatment for albums.
+private struct HitRow: View {
+    let artwork: String
+    let circular: Bool
+    let isAlbum: Bool
+    let title: String
+    let subtitle: String
+    let explicit: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ArtworkThumbnail(url: artwork, circular: circular, isAlbum: isAlbum)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(Font.nodalong.subheadlineMedium).foregroundStyle(Color.nodalong.textPrimary).lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(subtitle).font(Font.nodalong.caption)
+                        .foregroundStyle(Color.nodalong.textSecondary).lineLimit(1)
+                    if explicit {
+                        Text("E")
+                            .font(Font.nodalong.custom(9, .bold))
+                            .foregroundStyle(Color.nodalong.textSecondary)
+                            .padding(.horizontal, 3).padding(.vertical, 1)
+                            .background(Color.nodalong.textPrimary.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+                    }
+                }
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(Font.nodalong.captionBold)
+                .foregroundStyle(Color.nodalong.textSecondary)
+        }
+        .contentShape(.rect)
+    }
+}
+
 private struct TrackSearchRow: View {
     let track:        SearchItem
     var isLiked:      Bool           = false
@@ -977,9 +1283,7 @@ private struct TrackSearchRow: View {
             Spacer()
             TrackActionsMenuButton(
                 song:         .from(searchItem: track),
-                onAddToQueue: onAddToQueue,
-                onToggleLike: onLike,
-                isLiked:      isLiked
+                onAddToQueue: onAddToQueue
             )
         }
         .contentShape(.rect)

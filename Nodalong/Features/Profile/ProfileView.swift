@@ -1,5 +1,6 @@
 import SwiftUI
 import MusicKit
+import FirebaseAuth
 import NodalongKit
 
 /// The current user's own profile screen.
@@ -13,7 +14,6 @@ struct ProfileView: View {
     @EnvironmentObject private var musicService:  AppleMusicService
     @EnvironmentObject private var spotifyService: SpotifyMusicService
     @EnvironmentObject private var syncService:  LibrarySyncService
-    @EnvironmentObject private var shelfVM:      ShelfViewModel
     @EnvironmentObject private var playerVM:     PlayerViewModel
     @EnvironmentObject private var libraryVM:    LibraryViewModel
     @EnvironmentObject private var playlistsVM:  PlaylistsViewModel
@@ -35,6 +35,7 @@ struct ProfileView: View {
     private var isSpotifyLinked: Bool { authVM.profile?.activeService == .spotify }
 
     @State private var showEdit          = false
+    /// Whether the header is currently scrolled away.
     @State private var followerCount     = 0
     @State private var followingCount    = 0
     @State private var recentTracks:    [Post]           = []
@@ -90,6 +91,7 @@ struct ProfileView: View {
         // navigation bug (white screen, auto pop-back). The three
         // `.navigationDestination(for:)` modifiers below work identically
         // whether declared on an owned or an inherited stack.
+        VStack(spacing: 0) {
         ScrollView {
             VStack(spacing: 24) {
                 avatarSection
@@ -99,7 +101,9 @@ struct ProfileView: View {
                 recentTracksSection
                 musicSection
                 appearanceSection
+                tasteSection
                 albumArtworkSection
+                diagnosticsSection
                 signOutButton
                 // Breathing room between Sign Out and the mini player.
                 // Matches the FeedView pattern — only added when something
@@ -127,9 +131,15 @@ struct ProfileView: View {
             }
             await refresh()
         }
-        .background(Color.nodalong.bgBase)
-        .navigationTitle("Profile")
-        .navigationBarTitleDisplayMode(.inline)
+        }
+        // Hoisted off `ScreenHeader` so the pop-gesture install survives the
+        // header being collapsed away — see `SwipeBackGesture.swift`. It
+        // matters more here than on the tab roots: this screen is pushed, so
+        // edge-swipe is the fallback while the chevron is hidden.
+        .enablesInteractiveSwipeBack()
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        .screenControls()
         .navigationDestination(item: $selectedPlaylist) { playlist in
             PlaylistDetailView(playlist: playlist)
         }
@@ -155,12 +165,7 @@ struct ProfileView: View {
         .navigationDestination(for: UserProfile.self) { user in
             UserProfileView(user: user)
         }
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button("Edit") { showEdit = true }
-                    .foregroundStyle(Color.nodalong.purpleAccent)
-            }
-        }
+        .navigationDestination(for: TasteRoute.self) { _ in TasteView() }
         .sheet(isPresented: $showEdit) {
             EditProfileView()
         }
@@ -196,6 +201,13 @@ struct ProfileView: View {
                     .foregroundStyle(Color.nodalong.textSecondary)
                     .multilineTextAlignment(.center)
             }
+            // Moved out of the header band, which is gone. Sitting directly
+            // under the avatar/username/bio it edits is a better home for it
+            // than a corner of a bar — and no title is needed here, since
+            // those three already say whose profile this is.
+            Button("Edit Profile") { showEdit = true }
+                .font(Font.nodalong.subheadlineMedium)
+                .foregroundStyle(Color.nodalong.purpleAccent)
         }
     }
 
@@ -220,7 +232,9 @@ struct ProfileView: View {
                 StatCell(value: "\(followingCount)", label: "Following")
             }
             .buttonStyle(.plain)
-            StatCell(value: "\(shelfVM.tracks.count)", label: "Tracks")
+            // The library, not Shelf's view model: that one only loads once Shelf
+            // is visited, so this read 0 until then.
+            StatCell(value: "\(libraryVM.tracks.count)", label: "Tracks")
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 16)
@@ -237,7 +251,7 @@ struct ProfileView: View {
                     .font(Font.nodalong.headline)
                     .foregroundStyle(Color.nodalong.textPrimary)
                 Spacer()
-                let todayCount = authVM.profile?.spotlightTracks.count ?? 0
+                let todayCount = authVM.todaySpotlitIds.count
                 Text("\(todayCount)/\(maxSpotlights) today")
                     .font(Font.nodalong.caption)
                     .foregroundStyle(Color.nodalong.textSecondary)
@@ -251,7 +265,7 @@ struct ProfileView: View {
                     .frame(height: 188)
                     .redacted(reason: .placeholder)
             } else if days.isEmpty {
-                Text("Tap the star on feed cards or shelf tracks to spotlight them.")
+                Text("Spotlight any track from its \"•••\" menu.")
                     .font(Font.nodalong.subheadline)
                     .foregroundStyle(Color.nodalong.textSecondary)
                     .padding(12)
@@ -261,9 +275,6 @@ struct ProfileView: View {
             } else {
                 SpotlightCarousel(
                     days: days,
-                    onRemove: { trackId in
-                        Task { await authVM.removeFromSpotlight(trackId: trackId) }
-                    },
                     onPlay: { track in
                         guard activeService.isAuthenticated else { return }
                         Task { await playerVM.play(.from(spotlight: track)) }
@@ -276,10 +287,9 @@ struct ProfileView: View {
         }
     }
 
-    /// Own-profile recent tracks — full callback set: tap to play, star to
-    /// spotlight (subject to the 3/day cap), heart to add to shelf.
-    /// Renders via the shared paged carousel so the layout matches
-    /// `UserProfileView` exactly.
+    /// Own-profile recent tracks — tap to play, heart to add to shelf, "…"
+    /// menu for everything else including Spotlight. Renders via the shared
+    /// paged carousel so the layout matches `UserProfileView` exactly.
     @ViewBuilder
     private var recentTracksSection: some View {
         if !recentTracks.isEmpty {
@@ -295,23 +305,6 @@ struct ProfileView: View {
                     onPlay:    { post in
                         guard activeService.isAuthenticated else { return }
                         Task { await playerVM.play(.from(post: post)) }
-                    },
-                    onSpotlight: { post in
-                        let isSpotlit = authVM.todaySpotlitIds.contains(post.catalogId)
-                        Task {
-                            if isSpotlit {
-                                await authVM.removeFromSpotlight(trackId: post.catalogId)
-                            } else {
-                                let doc = LibraryTrackDoc(
-                                    catalogId: post.catalogId, title: post.title,
-                                    artist: post.artist, album: post.album,
-                                    artwork: post.artwork, uri: post.uri,
-                                    sourceService: post.sourceService,
-                                    savedAt: Date().timeIntervalSince1970 * 1000
-                                )
-                                await authVM.addToSpotlight(doc)
-                            }
-                        }
                     },
                     onLike: { post in
                         guard let uid = authVM.currentUser?.uid else { return }
@@ -358,6 +351,37 @@ struct ProfileView: View {
     /// `@AppStorage(appearanceModeKey)` — the same key `NodalongApp` reads
     /// to drive `.preferredColorScheme(_:)`, so picking a segment here takes
     /// effect immediately with no extra plumbing.
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Diagnostics")
+                .font(Font.nodalong.headline)
+                .foregroundStyle(Color.nodalong.textPrimary)
+
+            ShareLink(
+                item: DiagnosticsReport(),
+                preview: SharePreview("Nodalong diagnostics")
+            ) {
+                HStack {
+                    Image(systemName: "waveform.path.ecg")
+                    Text("Share diagnostics")
+                    Spacer()
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .font(Font.nodalong.body)
+                .foregroundStyle(Color.nodalong.textPrimary)
+                .padding(12)
+                .background(Color.nodalong.bgCard)
+                .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+            }
+            .buttonStyle(.plain)
+
+            Text("If playback stops unexpectedly, tap this and send me the file. It records what the app and iOS were doing — never track names, usernames or locations — and only leaves your phone when you share it.")
+                .font(Font.nodalong.caption)
+                .foregroundStyle(Color.nodalong.textSecondary)
+        }
+    }
+
+    /// Appearance picker (System / Light / Dark).
     private var appearanceSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Appearance")
@@ -391,6 +415,22 @@ struct ProfileView: View {
     /// `albumArtworkStyleKey`) kept as originally named — purely internal,
     /// not worth a rename now that 25+ call sites reference them; only the
     /// user-facing label changed to reflect the broader scope.
+    private var tasteSection: some View {
+        NavigationLink(value: TasteRoute()) {
+            HStack {
+                Text("Your taste").font(Font.nodalong.headline)
+                    .foregroundStyle(Color.nodalong.textPrimary)
+                Spacer()
+                Image(systemName: "chevron.right").font(Font.nodalong.captionBold)
+                    .foregroundStyle(Color.nodalong.textSecondary)
+            }
+            .padding(12)
+            .background(Color.nodalong.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
     private var albumArtworkSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Artwork Style")
@@ -544,6 +584,15 @@ struct ProfileView: View {
     /// relaunch. `spotlightTracks` for TODAY are deliberately absent — those
     /// come from `authVM.profile`, which is already loaded at auth and
     /// renders instantly; it's the historic carousel that was cold.
+    /// Deliberately NOT "profile": `FirebaseAuthViewModel` stores the
+    /// signed-in `UserProfile` under that key for its instant-launch path.
+    /// Sharing it made the two overwrite each other — this screen opened
+    /// blank after every launch, and after any profile visit the next launch
+    /// couldn't restore the user, which also skipped the own-profile warm-up
+    /// in `ContentView` and showed the splash. Confirmed from a device log,
+    /// 2026-10-30 (`snap=nil peek=nil` on open).
+    private static let snapshotKey = "profileScreen"
+
     private struct ProfileSnapshot: Codable {
         var spotlightHistory: [SpotlightTrack]
         var recentTracks: [Post]
@@ -555,9 +604,32 @@ struct ProfileView: View {
     /// shared `SnapshotStore` — Profile was the one screen with no cache at
     /// all, so every visit paid a cold network read and showed the spotlight
     /// skeleton before anything appeared.
+    /// Reads the saved snapshot synchronously at construction so last session's
+    /// content is on screen on the FIRST frame. Previously this ran inside
+    /// `refresh()` (in `.task`), i.e. after the first render, so the skeleton
+    /// showed and then the content popped in. `Auth.auth().currentUser` is
+    /// restored from the keychain synchronously, so the uid is known here.
+    init() {
+        if let uid = Auth.auth().currentUser?.uid,
+           let snap = SnapshotStore.load(ProfileSnapshot.self, key: Self.snapshotKey, uid: uid) {
+            _spotlightHistory = State(initialValue: snap.spotlightHistory)
+            _recentTracks     = State(initialValue: snap.recentTracks)
+            _followerCount    = State(initialValue: snap.followerCount)
+            _followingCount   = State(initialValue: snap.followingCount)
+        }
+        // The launch-time warm of your own bundle (`ContentView`) is fresher than
+        // last session's disk snapshot — prefer it when present. It has no
+        // following count, so that stays from the snapshot.
+        if let uid = Auth.auth().currentUser?.uid, let b = SocialCache.peekBundle(uid: uid, maxAge: 600) {
+            _spotlightHistory = State(initialValue: b.spotlightHistory)
+            _recentTracks     = State(initialValue: b.recentTracks)
+            _followerCount    = State(initialValue: b.followerCount)
+        }
+    }
+
     private func restoreSnapshot(uid: String) {
         guard spotlightHistory == nil,
-              let snap = SnapshotStore.load(ProfileSnapshot.self, key: "profile", uid: uid)
+              let snap = SnapshotStore.load(ProfileSnapshot.self, key: Self.snapshotKey, uid: uid)
         else { return }
         spotlightHistory = snap.spotlightHistory
         recentTracks     = snap.recentTracks
@@ -602,7 +674,7 @@ struct ProfileView: View {
                 followerCount: newFollowers,
                 followingCount: newFollowing
             ),
-            key: "profile", uid: uid
+            key: Self.snapshotKey, uid: uid
         )
     }
 

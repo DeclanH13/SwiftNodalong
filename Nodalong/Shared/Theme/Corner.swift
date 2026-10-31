@@ -44,4 +44,9 @@ enum Corner {
     /// Circular artwork (avatars, the spinning mini-player disc, a vinyl
     /// label) clips to `Circle()` on its own path and is unaffected.
     static let artwork: CGFloat = 0
+
+    /// Playlist covers. Unlike an album sleeve, a playlist cover is a
+    /// collage/picked image with no "record" to preserve, and square corners
+    /// read as harsh against the rounded containers around it.
+    static let playlistCover: CGFloat = 14
 }

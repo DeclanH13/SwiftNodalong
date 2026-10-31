@@ -43,9 +43,11 @@ struct AddToPlaylistSheet: View {
             }
             .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
-            .background(Color.nodalong.bgBase)
+            .screenBackground()
             .navigationTitle("Add to Playlist")
             .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
@@ -67,6 +69,7 @@ struct AddToPlaylistSheet: View {
     private func row(_ playlist: Playlist) -> some View {
         HStack(spacing: 12) {
             ArtworkThumbnail(url: playlist.coverArtwork, size: 44)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             VStack(alignment: .leading, spacing: 2) {
                 Text(playlist.title)
                     .font(Font.nodalong.subheadlineMedium)
@@ -139,9 +142,11 @@ struct CreatePlaylistSheet: View {
                 .listRowBackground(Color.nodalong.bgCard)
             }
             .scrollContentBackground(.hidden)
-            .background(Color.nodalong.bgBase)
+            .screenBackground()
             .navigationTitle("New Playlist")
             .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

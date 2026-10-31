@@ -11,6 +11,10 @@ import NodalongKit
 ///
 /// Lives in the app target rather than `NodalongKit` because these types
 /// don't all share a single concept — this is glue, not a domain model.
+///
+/// `LibraryTrackDoc.from(song:)` at the bottom runs the other way, for the
+/// write paths (save to Shelf, spotlight) that take a document rather than a
+/// `Song`.
 extension Song {
     /// Promote a feed `Post` to a playable `Song`.
     static func from(post: Post) -> Song {
@@ -139,7 +143,36 @@ extension Song {
             isrc:             i.isrc,
             duration:         i.duration,
             trackNumber:      i.trackNumber,
-            albumReleaseDate: i.albumReleaseDate
+            albumReleaseDate: i.albumReleaseDate,
+            isExplicit:       i.isExplicit,
+            isPlayable:       i.isPlayable,
+            releaseDate:      i.releaseDate
+        )
+    }
+}
+
+/// Demote a `Song` back to a library document, for the save/spotlight write
+/// paths — `toggleLibrary` and `addToSpotlight` both take a `LibraryTrackDoc`,
+/// and four screens were building this same value inline to call them.
+///
+/// `savedAt` is stamped now: a doc built here is always about to be written.
+extension LibraryTrackDoc {
+    static func from(song s: Song) -> LibraryTrackDoc {
+        LibraryTrackDoc(
+            catalogId:        s.catalogId ?? "",
+            title:            s.title,
+            artist:           s.artist,
+            album:            s.album,
+            artwork:          s.artwork,
+            uri:              s.uri,
+            sourceService:    s.sourceService,
+            isrc:             s.isrc,
+            duration:         s.duration,
+            trackNumber:      s.trackNumber,
+            albumReleaseDate: s.albumReleaseDate,
+            genres:           s.genres,
+            isExplicit:       s.isExplicit,
+            savedAt:          Date().timeIntervalSince1970 * 1000
         )
     }
 }

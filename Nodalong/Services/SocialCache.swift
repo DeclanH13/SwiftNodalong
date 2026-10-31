@@ -44,6 +44,29 @@ actor SocialCache {
     static let shared = SocialCache()
     private init() {}
 
+    /// Lock-protected mirror of `bundles`, readable WITHOUT awaiting. An actor
+    /// read costs a hop, so a view that asked for a warm bundle in `.task`
+    /// always painted its first frame empty and popped the content in a beat
+    /// later. This lets `UserProfileView.init` seed its state synchronously, so
+    /// a warm profile is complete on the very first frame.
+    private final class Peek: @unchecked Sendable {
+        private let lock = NSLock()
+        private var store: [String: (bundle: ProfileBundle, at: Date)] = [:]
+        func get(_ uid: String, maxAge: TimeInterval) -> ProfileBundle? {
+            lock.lock(); defer { lock.unlock() }
+            guard let e = store[uid], Date().timeIntervalSince(e.at) < maxAge else { return nil }
+            return e.bundle
+        }
+        func set(_ uid: String, _ b: ProfileBundle) { lock.lock(); store[uid] = (b, Date()); lock.unlock() }
+        func remove(_ uid: String) { lock.lock(); store[uid] = nil; lock.unlock() }
+        func removeAll() { lock.lock(); store.removeAll(); lock.unlock() }
+    }
+    private static let peek = Peek()
+
+    nonisolated static func peekBundle(uid: String, maxAge: TimeInterval = 120) -> ProfileBundle? {
+        peek.get(uid, maxAge: maxAge)
+    }
+
     private var bundles:     [String: (bundle: ProfileBundle, at: Date)] = [:]
     private var bundleTasks: [String: Task<ProfileBundle, Never>] = [:]
 
@@ -69,16 +92,16 @@ actor SocialCache {
         let task = Task { () -> ProfileBundle in
             async let tracks    = getYourMusicFeed(uid: uid)
             async let history   = getSpotlightHistory(uid: uid)
-            async let playlists = getUserPlaylists(uid: uid)
+            async let playlists = getVisiblePlaylists(ownerUid: uid, viewerUid: viewerUid)
             async let count     = getFollowerCount(uid: uid)
             async let follows   = isFollowing(myUid: viewerUid, targetUid: uid)
             return ProfileBundle(
                 recentTracks:     (try? await tracks)  ?? [],
                 spotlightHistory: (try? await history) ?? [],
-                // Without security rules enforcing visibility yet, private
-                // playlists are filtered client-side — same rule the view
-                // applied before this moved here.
-                playlists:        ((try? await playlists) ?? []).filter { $0.visibility != .private },
+                // No client-side visibility filter any more: `getVisiblePlaylists`
+                // asks only for what this viewer is allowed to see, and
+                // `firestore.rules` enforces it server-side. One place decides.
+                playlists:        (try? await playlists) ?? [],
                 followerCount:    (try? await count)   ?? 0,
                 isFollowing:      (try? await follows) ?? false
             )
@@ -86,6 +109,7 @@ actor SocialCache {
         bundleTasks[uid] = task
         let value = await task.value
         bundles[uid] = (value, Date())
+        Self.peek.set(uid, value)
         bundleTasks[uid] = nil
         return value
     }
@@ -162,12 +186,14 @@ actor SocialCache {
 
     func invalidate(uid: String) {
         bundles[uid] = nil
+        Self.peek.remove(uid)
         lists[Self.listKey(uid, .followers)] = nil
         lists[Self.listKey(uid, .following)] = nil
     }
 
     func invalidateAll() {
         bundles.removeAll()
+        Self.peek.removeAll()
         lists.removeAll()
     }
 }

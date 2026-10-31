@@ -86,6 +86,10 @@ public struct AlbumResult: Codable, Identifiable, Hashable, Sendable {
     /// another album's `alternates`, so this never nests more than one level
     /// deep.
     public var alternates: [AlbumResult]
+    /// Genre tags (Apple's `genreNames`, umbrella "Music" dropped). Search uses
+    /// them so an album gets the same taste boost a song by the same artist does
+    /// — without them albums always ranked below songs. Empty when unknown.
+    public var genres: [String]
 
     public init(
         id: String,
@@ -98,7 +102,8 @@ public struct AlbumResult: Codable, Identifiable, Hashable, Sendable {
         sourceService: MusicServiceType,
         isExplicit: Bool = false,
         editionLabel: String? = nil,
-        alternates: [AlbumResult] = []
+        alternates: [AlbumResult] = [],
+        genres: [String] = []
     ) {
         self.id = id
         self.key = "album:\(id)"
@@ -112,6 +117,7 @@ public struct AlbumResult: Codable, Identifiable, Hashable, Sendable {
         self.isExplicit = isExplicit
         self.editionLabel = editionLabel
         self.alternates = alternates
+        self.genres = genres
     }
 
     /// Decode-tolerant by design — every field except `id` falls back to the
@@ -142,6 +148,7 @@ public struct AlbumResult: Codable, Identifiable, Hashable, Sendable {
         isExplicit = try c.decodeIfPresent(Bool.self, forKey: .isExplicit) ?? false
         editionLabel = try c.decodeIfPresent(String.self, forKey: .editionLabel)
         alternates = try c.decodeIfPresent([AlbumResult].self, forKey: .alternates) ?? []
+        genres = (try? c.decodeIfPresent([String].self, forKey: .genres)) ?? []
     }
 }
 

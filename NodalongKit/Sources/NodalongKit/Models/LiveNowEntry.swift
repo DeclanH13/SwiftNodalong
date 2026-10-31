@@ -4,7 +4,7 @@
 public struct LiveNowEntry: Identifiable, Hashable, Sendable {
     public enum Kind: Hashable, Sendable {
         case hostingParty(ListeningParty)
-        case listening(catalogId: String)
+        case listening(catalogId: String, isPreviewPlayback: Bool = false)
     }
 
     /// The uid — stable across a load, not a persistent app-wide identifier.

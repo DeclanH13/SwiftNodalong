@@ -57,9 +57,11 @@ struct EditProfileView: View {
                 .padding(.horizontal, 24)
                 .padding(.vertical, 24)
             }
-            .background(Color.nodalong.bgBase)
+            .screenBackground()
             .navigationTitle("Edit Profile")
             .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

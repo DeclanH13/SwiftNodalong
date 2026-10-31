@@ -28,17 +28,30 @@ struct HomeView: View {
     /// `NowPlayingView`/`PartyView` push here after dismissing themselves,
     /// which private `@State` never could. See `AppRouter`'s doc comment.
     @EnvironmentObject private var router:      AppRouter
+    @EnvironmentObject private var playlistsVM: PlaylistsViewModel
+    @EnvironmentObject private var generator:   PlaylistGenerator
+    @EnvironmentObject private var locationService: LocationService
+    /// The user's own pin/hide choices. Device-local (`UserDefaults`) — see
+    /// the type's own doc comment for why this isn't Firestore.
+    @EnvironmentObject private var homeLayout: HomeLayoutPreferences
 
     @State private var hasLoaded = false
+    /// Driven by a re-tap of the Home tab while already at the root.
+    @State private var scrollPosition = ScrollPosition(edge: .top)
+    /// When Home last finished a full load. Used to refresh on foreground-
+    /// return after a long absence — `hasLoaded` alone meant Home loaded
+    /// ONCE per process, and iOS keeps a suspended app alive for days, so
+    /// rails like New Releases could sit stale for weeks.
+    @State private var lastLoadedAt: Date?
+    @Environment(\.scenePhase) private var scenePhase
+    private static let staleAfter: TimeInterval = 6 * 3600
+    /// Whether the tab-root header is currently scrolled away.
+    /// Which section's long-press menu is open, if any.
+    @State private var sectionMenuTarget: HomeSectionID?
+    @State private var showLayoutSheet = false
+
     /// Guards a Live Now avatar tap while that user's profile is resolving.
     @State private var isResolvingLiveNowUser = false
-    /// Tap→open zoom transition for album tiles — see
-    /// `SearchView.zoomNamespace`'s doc comment for why this has to live on
-    /// the screen that owns the `NavigationStack`. Threaded into
-    /// `RecommendedForYouView` too, since it's pushed onto this same stack
-    /// and shares this stack's `AlbumResult` destination.
-    @Namespace private var zoomNamespace
-
     /// Whichever backend is actually connected — the play gate must check
     /// this, not hardcode Apple Music.
     private var activeService: any MusicService {
@@ -51,8 +64,12 @@ struct HomeView: View {
     /// false (and the real sections take over one by one) well before the
     /// slowest section finishes.
     private var showFirstLaunchSkeletons: Bool {
-        (homeVM.isLoading || libraryVM.isLoading) && !homeVM.restoredFromSnapshot
-            && homeVM.recentAlbums.isEmpty && homeVM.topChartSongs.isEmpty
+        (homeVM.isLoading || homeVM.isBatchOpen || libraryVM.isLoading) && !homeVM.restoredFromSnapshot
+            // `cityChartSongs` replaces the retired Top Charts here for the
+            // same reason it was used: it's fetched unconditionally, so it
+            // isn't gated behind an Apple Music subscription like the
+            // recommendation shelves are.
+            && homeVM.recentAlbums.isEmpty && homeVM.cityChartSongs.isEmpty
             && libraryVM.tracks.isEmpty && homeVM.recommendationShelves.isEmpty
     }
 
@@ -78,8 +95,13 @@ struct HomeView: View {
 
     var body: some View {
         NavigationStack(path: $router.homePath) {
+            VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                // Lazy: Home is one long scroll with no section cap, so
+                // sections below the fold must not build their bodies (and
+                // fire their per-tile prefetch tasks) at open. The cap used
+                // to be what kept that cost down; this is what replaces it.
+                LazyVStack(alignment: .leading, spacing: 24) {
                     greeting
 
                     if showFirstLaunchSkeletons {
@@ -88,94 +110,58 @@ struct HomeView: View {
                         section(title: "Recently Added") { SkeletonRail() }
                     }
 
-                    if !homeVM.liveNow.isEmpty {
-                        section(title: "Live Now") {
-                            liveNowRail
-                        }
-                    }
-
-                    if !homeVM.recentAlbums.isEmpty {
-                        section(title: "Jump Back In") {
-                            jumpBackInRail
-                        }
-                    }
-
-                    if !homeVM.friendsSpotlights.isEmpty {
-                        section(title: "Friends' Spotlights") {
-                            friendsSpotlightsRail
-                        }
-                    }
-
-                    if !friendsListeningAlbums.isEmpty {
-                        section(title: "Friends are listening to") {
-                            friendsListeningRail
-                        }
-                    }
-
-                    if !mostNoddedThisWeek.isEmpty {
-                        section(title: "Most nodded this week") {
-                            mostNoddedList
-                        }
-                    }
-
-                    if !homeVM.topChartSongs.isEmpty {
-                        section(title: "Top Charts") {
-                            topChartsRail
-                        }
-                    }
-
-                    if !homeVM.recommendationShelves.isEmpty {
-                        recommendedSection
-                    }
-
-                    if !homeVM.madeForYouPlaylists.isEmpty {
-                        section(title: "Made For You") {
-                            madeForYouRail
-                        }
-                    }
-
-                    if !recentShelfAlbums.isEmpty {
-                        section(title: "Recently Added") {
-                            recentlyAddedFromShelfRail
-                        }
+                    // Eleven hardcoded `if !x.isEmpty` blocks used to live
+                    // here in fixed source order. They're now values
+                    // (`HomeSectionID`) so ordering, pinning and hiding
+                    // are decisions about an array — see
+                    // `orderHomeSections`.
+                    ForEach(orderedSections, id: \.self) { id in
+                        sectionBody(id)
                     }
 
                     if playerVM.nowPlaying != nil {
                         Color.clear.frame(height: 70)
                     }
                 }
-                .padding(.top, 8)
+            }
+            .scrollPosition($scrollPosition)
+            .onChange(of: router.scrollToTopRequests[.home]) {
+                withAnimation(.easeInOut(duration: 0.3)) { scrollPosition.scrollTo(edge: .top) }
             }
             .gatesMarqueeToScrollSettle()
-            .background(Color.nodalong.bgBase)
-            .navigationTitle("Home")
-            .navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(for: Playlist.self) { PlaylistDetailView(playlist: $0) }
-            .navigationDestination(for: AlbumResult.self) { album in
-                AlbumDetailSearchView(album: album)
-                    .navigationTransition(.zoom(sourceID: album.key, in: zoomNamespace))
             }
+            // Hoisted off `ScreenHeader` so the pop-gesture install survives
+            // the header being collapsed away. `PlaylistDetailView` draws its
+            // own header and depends on the tab root's install to get
+            // edge-swipe at all — see `SwipeBackGesture.swift`.
+            .enablesInteractiveSwipeBack()
+            .screenBackground()
+            .toolbar(.hidden, for: .navigationBar)
+            .navigationDestination(for: Playlist.self) { PlaylistDetailView(playlist: $0) }
+            .navigationDestination(for: AlbumResult.self) { AlbumDetailSearchView(album: $0) }
             .navigationDestination(for: ArtistResult.self) { ArtistDetailSearchView(artist: $0) }
             .navigationDestination(for: PlaylistResult.self) { PlaylistDetailSearchView(playlist: $0) }
             // Landed here from `router.dismissThenPush` — NowPlayingView's
             // artist/album tap, or PartyView's — since a push always targets
             // whichever tab happens to be selected, not necessarily this one.
             .navigationDestination(for: PendingArtistResolve.self) { pending in
-                ResolvingArtistsView(name: pending.artist) {
+                ResolvingArtistsView(name: pending.artist, cached: cachedPendingArtists(pending, playerVM: playerVM)) {
                     await resolvePendingArtists(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .navigationDestination(for: PendingAlbumResolve.self) { pending in
-                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork) {
+                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork,
+                                   cached: cachedPendingAlbum(pending, playerVM: playerVM)) {
                     await resolvePendingAlbum(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .navigationDestination(for: RecentAlbum.self) { album in
-                ResolvingAlbumView(name: album.albumName, artistName: album.artistName, artwork: album.artwork) {
+                ResolvingAlbumView(name: album.albumName, artistName: album.artistName, artwork: album.artwork,
+                                   cached: MusicDetailCache.peekResolvedAlbum(key: album.id)) {
                     // Routed through `MusicDetailCache.resolvedAlbum` (keyed
                     // by `album.id`, the stable grouping key) rather than
                     // calling `resolveAlbum` directly — lets `recentAlbumTile`'s
-                    // own per-tile `.task(id:)` prefetch (`prefetchAlbumResolve`)
+                    // own per-tile `.task(id:)` prefetch (`CatalogPrefetch.albumResolve`)
                     // warm this exact result before the tap, so a tile that's
                     // been on screen for a moment opens with tracks already
                     // loaded instead of resolving cold.
@@ -217,10 +203,15 @@ struct HomeView: View {
                 FollowListView(uid: t.uid, mode: t.mode, username: t.username)
             }
             .navigationDestination(for: UserProfile.self) { UserProfileView(user: $0) }
-            .navigationDestination(for: SeeAllRecommendations.self) { _ in RecommendedForYouView(namespace: zoomNamespace) }
+            .navigationDestination(for: SeeAllRecommendations.self) { _ in RecommendedForYouView(prefetched: homeVM.allRecommendationShelves) }
+            // Every other capped rail's "see all". `SeeAllRecommendations`
+            // is kept separate rather than folded in here: it re-fetches at
+            // a different `maxGroups` and already has its own screen.
+            .navigationDestination(for: HomeSeeAll.self) { HomeSeeAllView(section: $0.section) }
             .navigationDestination(for: AlbumGroup.self) { ShelfAlbumQuickView(group: $0) }
             .navigationDestination(for: FriendsListeningAlbum.self) { album in
-                ResolvingAlbumView(name: album.albumName, artistName: album.artistName, artwork: album.artwork) {
+                ResolvingAlbumView(name: album.albumName, artistName: album.artistName, artwork: album.artwork,
+                                   cached: MusicDetailCache.peekResolvedAlbum(key: album.id)) {
                     // Same fix as Jump Back In's RecentAlbum destination
                     // above — routed through `MusicDetailCache.resolvedAlbum`
                     // so the background prefetch below can warm it, and
@@ -235,43 +226,87 @@ struct HomeView: View {
                 }
             }
             .profileEntryPoint()
+            // `.enablesInteractiveSwipeBack()` only — the profile avatar
+            // lives in `greeting` as its own `ProfileAvatarRow()`, inline
+            // content rather than a floating overlay. `showsBack: false` — a
+            // tab root has nothing to pop to.
+            .screenControls(showsBack: false)
             .refreshable { await load() }
             .task {
+                if let uid = authVM.currentUser?.uid { homeLayout.load(uid: uid) }
                 guard !hasLoaded else { return }
                 hasLoaded = true
                 await load()
             }
+            // 🔴 Lives here, not on `madeByPeopleSection` as it used to.
+            // That section can now sit far below the fold in a lazy stack and never
+            // render at all, which would mean nothing on Home ever loads
+            // `playlistsVM` — the exact bug this trigger was added to fix
+            // in the first place, silently reintroduced by making sections
+            // conditional.
+            .task { await loadAndRefreshGenerated() }
+            // The tile set can grow after launch (genres appear once the library
+            // finishes enriching, "Around You" once there's a location fix). The
+            // pass is idempotent, so re-running it is harmless.
+            .onChange(of: libraryVM.discoverableGenreEntries.map(\.name)) { _, _ in
+                Task { await loadAndRefreshGenerated() }
+            }
+            .onChange(of: libraryVM.artistEntries.count) { _, _ in
+                Task { await loadAndRefreshGenerated() }
+            }
+            .onChange(of: locationService.geohash) { _, _ in
+                Task { await loadAndRefreshGenerated() }
+            }
+            .sheet(isPresented: $showLayoutSheet) {
+                HomeLayoutSheet()
+            }
+            // A long-press menu, deliberately NOT `.contextMenu`: this repo
+            // already migrated off it once because its UIKit lift effect
+            // floods the console with `_UIGravityWellEffectAnchorView` /
+            // `_UIReparentingView` warnings as rows recycle.
+            .confirmationDialog(
+                sectionMenuTarget?.title ?? "",
+                isPresented: Binding(
+                    get: { sectionMenuTarget != nil },
+                    set: { if !$0 { sectionMenuTarget = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                if let id = sectionMenuTarget {
+                    Button(homeLayout.isPinned(id) ? "Unpin" : "Pin to top") {
+                        homeLayout.togglePin(id)
+                    }
+                    if id.hasSeeAll {
+                        Button("See all") { router.push(HomeSeeAll(section: id), onto: .home) }
+                    }
+                    if id.isHideable {
+                        Button("Hide this section", role: .destructive) {
+                            homeLayout.setHidden(id, true)
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                }
+            }
+            // Coming back to the app after hours: refresh. The commit window
+            // keeps this to a single quiet update rather than a reshuffle.
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .active, hasLoaded,
+                      let last = lastLoadedAt,
+                      Date().timeIntervalSince(last) > Self.staleAfter else { return }
+                Task { await load() }
+            }
             .onChange(of: musicService.canPlayFullTracks) { _, _ in
                 Task { await homeVM.refreshPersonalizedContentIfNeeded(musicService: musicService) }
             }
-            // Same browse-time prefetch as SearchView — warms
-            // `MusicDetailCache` for Recommended for You's albums while
-            // they're still just scrolling past, not yet tapped. Bounded to
-            // the first 2 shelves × 6 albums (roughly what fits above the
-            // fold) rather than every shelf, since Home can have several.
-            .task(id: homeVM.recommendationShelves.map(\.id)) {
-                guard playerVM.activeService == .appleMusic else { return }
-                for album in homeVM.recommendationShelves.prefix(2).flatMap({ $0.albums.prefix(6) }) {
-                    let (albumId, albumName, artwork) = (album.id, album.name, album.artwork)
-                    // `.utility` + a short delay: this is convenience
-                    // prefetch for content the user hasn't tapped yet, not
-                    // load-bearing for anything on screen — it used to fire
-                    // at default priority immediately alongside Home/Feed/
-                    // Library's own launch loads and runSync's ingest,
-                    // competing for the same connection during the exact
-                    // window the first screen is trying to paint.
-                    Task(priority: .utility) {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        guard !Task.isCancelled else { return }
-                        _ = await MusicDetailCache.shared.tracks(albumId: albumId) {
-                            (try? await musicService.getAlbumTracks(albumId: albumId, albumName: albumName, artwork: artwork)) ?? []
-                        }
-                    }
-                }
-            }
+            // Recommended for You's prefetch now lives per-tile inside
+            // `AlbumsCarousel` (the shared component this section renders
+            // through), so it follows what's actually scrolled into view
+            // instead of warming a fixed first-2-shelves × 6 — and the
+            // "See All" screen, which uses the same carousel and previously
+            // had no prefetch at all, is covered for free.
             // Jump Back In / Friends Listening prefetch is per-tile now
             // (`recentAlbumTile`/`friendsListeningTile`'s own `.task(id:)`,
-            // via `prefetchAlbumResolve`) rather than a rail-level prefix —
+            // via `CatalogPrefetch.albumResolve`) rather than a rail-level prefix —
             // a fixed prefix left every tile beyond it just as cold as
             // before any of this prefetch existed, which is exactly what
             // was reported back after the first version of this shipped.
@@ -297,32 +332,244 @@ struct HomeView: View {
         // models already guard against a redundant fetch if Search/Feed
         // loaded them earlier this session, so calling them here too is
         // cheap and safe.
+        // One commit window across EVERYTHING Home loads — see
+        // `HomeViewModel.beginBatch`. The saved snapshot stays on screen and
+        // the page updates once, together, instead of rearranging itself as
+        // each source lands.
+        homeVM.beginBatch(uid: uid)
         async let home: Void = homeVM.load(uid: uid, musicService: musicService)
         async let library: Void = libraryVM.load(uid: uid)
         async let feed: Void = feedVM.load(myUid: uid)
         _ = await (home, library, feed)
         diagLog("HomeView.load: homeVM+libraryVM+feedVM ALL done in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+
+        // Sequenced after, not concurrent with, the three above: it reads
+        // the Shelf's artist list, which only exists once `libraryVM` has
+        // landed. Cheap on every launch after the first — the name→id
+        // resolves it depends on are disk-persisted in `MusicDetailCache`,
+        // and the section itself is restored instantly from the snapshot.
+        async let releases: Void = homeVM.loadNewReleases(
+            shelfArtists: topShelfArtistNames,
+            savedAlbumKeys: Set(libraryVM.albumGroups.map(\.key)),
+            musicService: musicService
+        )
+        async let genreChart: Void = homeVM.loadGenreChart(
+            genreName: topShelfGenreName, musicService: musicService
+        )
+        _ = await (releases, genreChart)
+        homeVM.commitBatch()
+        lastLoadedAt = Date()
     }
 
-    /// Album-level: people you follow, ranked by how many of them played
-    /// something from this album, capped to 10. Pure client-side
-    /// aggregation over `feedVM.posts` — no new Firestore query.
+    /// The genre the user actually listens to most, for Apple's per-genre
+    /// chart. `genreEntries` is already computed once per library change by
+    /// `LibraryViewModel` — never in a view body.
+    private var topShelfGenreName: String {
+        libraryVM.discoverableGenreEntries.max { $0.trackCount < $1.trackCount }?.name ?? ""
+    }
+
+    /// The Shelf's most-listened artists, which is what "New Releases" asks
+    /// Apple about.
+    ///
+    /// 30, not the 12 this shipped with. Measured on a real Shelf: 12 artists
+    /// yielded 4 in-window releases, of which 3 were already saved — one
+    /// tile. Most artists in a real library are catalogue acts who haven't
+    /// released anything recently, so the pool has to be wide enough for the
+    /// few who have. Each name is one `MusicDetailCache` lookup, disk-cached
+    /// after the first run, and they all fold into a single batched request.
+    private var topShelfArtistNames: [String] {
+        let top = libraryVM.artistEntries
+            .sorted { $0.trackCount > $1.trackCount }
+            .prefix(30)
+            .map(\.name)
+        // Plus the artists you've been saving and playing LATELY. The top-30
+        // by track count is nearly static, so asking only about them meant
+        // the same artists every time; recency is what changes as you
+        // listen, and it's where a brand-new release is most likely to land.
+        let recentSaves = libraryVM.albumGroupsByRecency.prefix(30).map(\.artistName)
+        let recentPlays = homeVM.recentAlbums.prefix(20).map(\.artistName)
+        var seen = Set<String>()
+        return (top + recentSaves + recentPlays)
+            .map { primaryArtist($0) }
+            .filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
+            .prefix(60)
+            .map { $0 }
+    }
+
+    /// Both rails are aggregations over the whole feed, so they are derived
+    /// once per change in `FeedViewModel` rather than recomputed here — these
+    /// are read twice per render each (availability check, then section body)
+    /// and this view observes nine app-wide objects.
     private var friendsListeningAlbums: [FriendsListeningAlbum] {
-        Array(NodalongKit.friendsListeningAlbums(from: feedVM.posts).prefix(10))
+        Array(feedVM.friendsListeningAlbums.prefix(10))
     }
 
-    /// Track-level: the most-nodded tracks among people you follow in the
-    /// last 7 days. Same data source as above, different aggregation.
-    private var mostNoddedThisWeek: [Post] {
-        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600).timeIntervalSince1970 * 1000
-        return NodalongKit.mostNoddedPosts(from: feedVM.posts, since: cutoff, limit: 10)
+    private var mostNoddedThisWeek: [Post] { feedVM.mostNoddedThisWeek }
+
+    /// Last Monday→Sunday, from data already in memory. Cheap (≤ ~300 rows),
+    /// but read twice per render, so it is kept to one pass.
+    private var weeklyRecap: WeeklyRecap {
+        let end = PlaylistGenerator.lastMondayStartMs()
+        let start = end - 7 * 86_400_000
+        return buildWeeklyRecap(
+            myPosts: homeVM.recentPosts, myLibrary: libraryVM.tracks,
+            mySpotlights: authVM.profile?.spotlightTracks ?? [], friendPosts: feedVM.posts,
+            weekStartMs: start, weekEndMs: end)
     }
 
+    // MARK: - Section ordering
+
+    /// Sections that currently have something to show. Order here doesn't
+    /// matter — `orderHomeSections` decides that from `baseRank`.
+    ///
+    /// The two generated-playlist sections are unconditional: their tiles
+    /// render a "generate this" state when no playlist exists yet, so an
+    /// empty `playlistsVM` is a valid thing to show rather than nothing.
+    private var availableSections: [HomeSectionID] {
+        var ids: [HomeSectionID] = [.madeByPeople, .foundForYou]
+        if !homeVM.liveNow.isEmpty            { ids.append(.liveNow) }
+        // "Your week" is switched off for now (judged not useful / out of place on
+        // Home). Everything behind it is intact; restore by re-adding the line:
+        // if !weeklyRecap.isEmpty               { ids.append(.weeklyRecap) }
+        // Jump Back In now also carries Apple's own recently-played
+        // containers, so it must appear when only those have content.
+        if !homeVM.recentAlbums.isEmpty || !recentlyPlayedUnseen.isEmpty
+            || !homeVM.recentlyPlayedPlaylists.isEmpty { ids.append(.jumpBackIn) }
+        if !homeVM.friendsSpotlights.isEmpty  { ids.append(.friendsSpotlights) }
+        if !homeVM.newReleases.isEmpty        { ids.append(.newReleases) }
+        if !homeVM.newMusicDaily.isEmpty      { ids.append(.newMusicDaily) }
+        if !homeVM.cityChartSongs.isEmpty     { ids.append(.cityCharts) }
+        if !homeVM.genreChartSongs.isEmpty    { ids.append(.genreCharts) }
+        if !friendsListeningAlbums.isEmpty    { ids.append(.friendsListening) }
+        // "Most nodded this week" is switched off for now (it didn't behave as
+        // expected — one nod, including your own plays, was enough to rank).
+        // Everything behind it is intact; restore by re-adding the line:
+        // if !mostNoddedThisWeek.isEmpty { ids.append(.mostNodded) }
+        // Apple's playlists render inside this section now, so it has to
+        // appear when EITHER half has content — otherwise the playlists are
+        // lost whenever Apple returns no album shelves.
+        if !homeVM.recommendationShelves.isEmpty || !homeVM.madeForYouPlaylists.isEmpty {
+            ids.append(.recommended)
+        }
+        if !recentShelfAlbums.isEmpty         { ids.append(.recentlyAdded) }
+        return ids
+    }
+
+    /// Which sections hold something genuinely new today. Everything here is
+    /// derived from data already in hand — no extra fetch.
+    ///
+    /// Only content that can actually change day to day qualifies.
+    /// Recommended for You and Recently Added are deliberately never fresh:
+    /// they look the same on every launch, which is exactly why they
+    /// shouldn't outrank a friend's spotlight for the top of the screen.
+    ///
+    /// 🔴 Every test here must be a REAL test. The chart rails used to
+    /// qualify on `!isEmpty`, which is always true, so they were permanently
+    /// fresh and sat above Live Now and Jump Back In whenever the user's
+    /// follows were quiet — precisely what this comment says must not happen.
+    /// They now come from `homeVM.freshCharts`, which compares against what
+    /// the previous launch showed.
+    private var freshSections: Set<HomeSectionID> {
+        var fresh: Set<HomeSectionID> = []
+        let now = Date().timeIntervalSince1970 * 1000
+        let dayAgo = now - 24 * 3600 * 1000
+        let weekAgo = Date().addingTimeInterval(-7 * 24 * 3600)
+
+        // Live Now is a right-now signal by definition — if it has anything
+        // in it at all, that thing is happening this second.
+        if !homeVM.liveNow.isEmpty { fresh.insert(.liveNow) }
+        // The recap is news on Monday and Tuesday, then settles to its base rank.
+        let weekday = Calendar.current.component(.weekday, from: Date())
+        if weekday == 2 || weekday == 3 { fresh.insert(.weeklyRecap) }
+
+        let today = dateKey(epochMs: now)
+        if homeVM.friendsSpotlights.contains(where: { dateKey(epochMs: $0.track.spotlitAt) == today }) {
+            fresh.insert(.friendsSpotlights)
+        }
+        // `releaseDate` is "yyyy-MM-dd", so comparing formatted strings is
+        // correct and avoids parsing every row back into a Date.
+        let weekAgoKey = Self.releaseDateFormatter.string(from: weekAgo)
+        if homeVM.newReleases.contains(where: { $0.releaseDate >= weekAgoKey }) {
+            fresh.insert(.newReleases)
+        }
+        // `.dailyGlobalTop` / city / genre charts genuinely turn over each
+        // day, unlike the `.mostPlayed` list this used to show — so they've
+        // earned the fresh bucket where the old sticky chart hadn't.
+        // Only when the chart actually turned over. A non-empty chart is not
+        // news — treating it as such made both chart rails permanently fresh,
+        // which floated them above every people-driven section on any quiet
+        // day. See `HomeViewModel.freshCharts`.
+        fresh.formUnion(homeVM.freshCharts)
+        if feedVM.posts.contains(where: { $0.createdAt > dayAgo }) {
+            fresh.insert(.friendsListening)
+        }
+        return fresh
+    }
+
+    private static let releaseDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private var orderedSections: [HomeSectionID] {
+        orderHomeSections(
+            available: availableSections,
+            fresh: freshSections,
+            pinned: homeLayout.pinned,
+            hidden: homeLayout.hidden
+        )
+    }
+
+    @ViewBuilder
+    private func sectionBody(_ id: HomeSectionID) -> some View {
+        switch id {
+        case .liveNow:           section(id) { liveNowRail }
+        case .jumpBackIn:        section(id) { jumpBackInRail }
+        case .weeklyRecap:       section(id) { WeeklyRecapCard(recap: weeklyRecap) }
+        case .friendsSpotlights: section(id) { friendsSpotlightsRail }
+        case .madeByPeople:      madeByPeopleSection
+        case .foundForYou:       tasteSection
+        case .newReleases:       section(id) { releaseRail(homeVM.newReleases) }
+        case .newMusicDaily:     section(id) { releaseRail(homeVM.newMusicDaily) }
+        case .cityCharts:        section(id, titleOverride: "Top in Your City") { chartRail(homeVM.cityChartSongs) }
+        case .genreCharts:       section(id, titleOverride: "Top in \(homeVM.genreChartName)") { chartRail(homeVM.genreChartSongs) }
+        case .friendsListening:  section(id) { friendsListeningRail }
+        case .mostNodded:        section(id) { mostNoddedList }
+        case .recommended:       recommendedSection
+        case .recentlyAdded:     section(id) { recentlyAddedFromShelfRail }
+        }
+    }
+
+    /// The avatar gets its own `ProfileAvatarRow()` above the greeting
+    /// rather than sitting inside the greeting row. Inside that row it was
+    /// vertically centred against the two-line title, which put it ~30pt
+    /// lower than on every other tab. As its own first row it lands at
+    /// exactly the same spot as on Feed, Search, Shelf and NearMe — all
+    /// five tabs now share one mechanism and one position. Still inline
+    /// content, so it scrolls away with everything else and can never
+    /// overlap anything.
     private var greeting: some View {
-        Text(greetingText)
-            .font(Font.nodalong.title2Bold)
-            .foregroundStyle(Color.nodalong.textPrimary)
+        VStack(alignment: .leading, spacing: 0) {
+            ProfileAvatarRow()
+            HStack {
+                Text(greetingText)
+                    .font(Font.nodalong.title2Bold)
+                    .foregroundStyle(Color.nodalong.textPrimary)
+                Spacer(minLength: 8)
+                Button { showLayoutSheet = true } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Color.nodalong.textSecondary)
+                        .frame(width: 44, height: 44, alignment: .trailing)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Manage Home sections")
+            }
             .padding(.horizontal, 16)
+        }
     }
 
     private var greetingText: String {
@@ -335,6 +582,8 @@ struct HomeView: View {
         }
     }
 
+    /// Plain titled section — used only by the first-launch skeletons, which
+    /// aren't real sections and have nothing to pin, hide or see all of.
     @ViewBuilder
     private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -346,6 +595,49 @@ struct HomeView: View {
         }
     }
 
+    /// A real section: its header taps through to "see all" (where there is
+    /// one), long-presses to the pin/hide menu, and shows a pin glyph when
+    /// the user has pinned it so the reason it's at the top is visible
+    /// rather than mysterious.
+    @ViewBuilder
+    private func section<Content: View>(
+        _ id: HomeSectionID,
+        titleOverride: String? = nil,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                if id.hasSeeAll { router.push(HomeSeeAll(section: id), onto: .home) }
+            } label: {
+                HStack(spacing: 6) {
+                    // `titleOverride` is for the two sections whose heading
+                    // names something only the running app knows — the
+                    // user's city, the user's own top genre.
+                    Text(titleOverride ?? id.title)
+                        .font(Font.nodalong.headline)
+                        .foregroundStyle(Color.nodalong.textPrimary)
+                    if homeLayout.isPinned(id) {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.nodalong.textTertiary)
+                    }
+                    Spacer(minLength: 8)
+                    if id.hasSeeAll {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.nodalong.textSecondary)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .onLongPressGesture { sectionMenuTarget = id }
+
+            content()
+        }
+    }
+
     /// Apple Music's personalized recommendations, rendered as their real
     /// titled shelves (e.g. "New Music Mix") rather than one flattened rail.
     /// Tapping the header pushes `RecommendedForYouView`, which re-fetches
@@ -353,12 +645,17 @@ struct HomeView: View {
     private var recommendedSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             Button {
-                router.homePath.append(SeeAllRecommendations())
+                router.push(SeeAllRecommendations(), onto: .home)
             } label: {
                 HStack {
-                    Text("Recommended for You")
+                    Text(HomeSectionID.recommended.title)
                         .font(Font.nodalong.headline)
                         .foregroundStyle(Color.nodalong.textPrimary)
+                    if homeLayout.isPinned(.recommended) {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.nodalong.textTertiary)
+                    }
                     Spacer()
                     Text("See All")
                         .font(Font.nodalong.subheadline)
@@ -370,6 +667,12 @@ struct HomeView: View {
                 .padding(.horizontal, 16)
             }
             .buttonStyle(.plain)
+            // This section builds its own header (it had a "See All" long
+            // before the generic one existed), so it has to opt into the
+            // pin/hide menu by hand. Worth doing rather than skipping: five
+            // Apple shelves make this the tallest thing on Home and the
+            // section a user is most likely to want gone.
+            .onLongPressGesture { sectionMenuTarget = .recommended }
 
             ForEach(homeVM.recommendationShelves) { shelf in
                 VStack(alignment: .leading, spacing: 8) {
@@ -377,7 +680,31 @@ struct HomeView: View {
                         .font(Font.nodalong.subheadlineSemibold)
                         .foregroundStyle(Color.nodalong.textSecondary)
                         .padding(.horizontal, 16)
-                    AlbumsCarousel(albums: shelf.albums, namespace: zoomNamespace)
+                    AlbumsCarousel(albums: shelf.albums)
+                }
+            }
+
+            // 🔴 Apple's playlists, from the SAME payload as the shelves
+            // above: `getPersonalRecommendations` and
+            // `getMadeForYouPlaylists` both read one
+            // `MusicPersonalRecommendationsRequest` response and share the
+            // in-flight request via `recommendationsMemo`. They were two
+            // top-level sections presenting one Apple response as two — and
+            // the second was titled "Made For You", four words from "Made for
+            // you, by real people", which is the section that actually
+            // matters on this screen.
+            //
+            // Rendering them as one more sub-shelf also retires a dead end:
+            // `.madeForYou` fell through `hasSeeAll`'s `default: true` and so
+            // offered a "See All ›", while `HomeSeeAllView` grouped it with
+            // the unreachable cases and answered "Nothing more to show here."
+            if !homeVM.madeForYouPlaylists.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Playlists for You")
+                        .font(Font.nodalong.subheadlineSemibold)
+                        .foregroundStyle(Color.nodalong.textSecondary)
+                        .padding(.horizontal, 16)
+                    madeForYouRail
                 }
             }
         }
@@ -417,12 +744,18 @@ struct HomeView: View {
                         isLiked: libraryVM.isInLibrary(catalogId: pick.track.catalogId, uri: pick.track.uri),
                         onAddToQueue: { playerVM.addToQueue(.from(spotlight: pick.track)) },
                         addToPlaylistSong: .from(spotlight: pick.track),
-                        onTapUser: { router.homePath.append(pick.user) }
+                        onTapUser: { router.push(pick.user, onto: .home) }
                     )
                     .frame(width: 220)
                 }
             }
             .padding(.horizontal, 16)
+        }
+        // Each card's username opens that person's profile — warm them while
+        // the rail is visible, same as Live Now (capped at 6 inside).
+        .task(id: homeVM.friendsSpotlights.map(\.user.uid)) {
+            guard let me = authVM.currentUser?.uid else { return }
+            SocialCache.shared.prefetch(uids: homeVM.friendsSpotlights.map(\.user.uid), viewerUid: me)
         }
     }
 
@@ -439,9 +772,35 @@ struct HomeView: View {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(homeVM.recentAlbums) { album in
                     Button {
-                        router.homePath.append(album)
+                        router.push(album, onto: .home)
                     } label: {
                         recentAlbumTile(album)
+                    }
+                    .buttonStyle(.plain)
+                }
+                // Apple's own recently-played containers, already deduped
+                // against the rows above by `recentlyPlayedUnseen` — so what
+                // lands here is exactly the listening that never went through
+                // Nodalong, which is the only part worth showing twice. This
+                // was its own "Recently Played" section carrying about six
+                // items, one of three separate rails covering your own
+                // history.
+                ForEach(recentlyPlayedUnseen) { album in
+                    NavigationLink(value: album) {
+                        AlbumCard(album: album)
+                    }
+                    .buttonStyle(.plain)
+                    // `AlbumsCarousel` owns the per-tile prefetch, not
+                    // `AlbumCard`, so a bare card had none — these tiles
+                    // opened cold while the rest of this rail was warm.
+                    .task(id: album.id, priority: .utility) { await prefetchAlbum(album) }
+                }
+                // Playlists can only come from Apple's side: Jump Back In
+                // infers albums from track metadata, and a playlist has no
+                // album to infer.
+                ForEach(homeVM.recentlyPlayedPlaylists) { playlist in
+                    NavigationLink(value: playlist) {
+                        madeForYouTile(playlist)
                     }
                     .buttonStyle(.plain)
                 }
@@ -457,8 +816,10 @@ struct HomeView: View {
     private func recentAlbumTile(_ album: RecentAlbum) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             ArtworkThumbnail(url: album.artwork, size: 140, isAlbum: true)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
-            MarqueeText(text: album.albumName, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+            HStack(spacing: 4) {
+                MarqueeText(text: album.albumName, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+                if album.isExplicit { ExplicitBadge() }
+            }
             Text(album.artistName)
                 .font(Font.nodalong.caption2)
                 .foregroundStyle(Color.nodalong.textSecondary)
@@ -473,7 +834,11 @@ struct HomeView: View {
         // cold as before this whole prefetch existed). Auto-cancels if the
         // tile scrolls back out before the resolve finishes.
         .task(id: album.id) {
-            await prefetchAlbumResolve(id: album.id, uri: album.uri, isrc: album.isrc, albumName: album.albumName, artistName: album.artistName, trackTitle: album.trackTitle)
+            guard playerVM.activeService == .appleMusic else { return }
+            await CatalogPrefetch.albumResolve(key: album.id, uri: album.uri, isrc: album.isrc,
+                                               albumName: album.albumName, artistName: album.artistName,
+                                               trackTitle: album.trackTitle, artwork: album.artwork,
+                                               service: musicService)
         }
     }
 
@@ -487,7 +852,7 @@ struct HomeView: View {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(friendsListeningAlbums) { album in
                     Button {
-                        router.homePath.append(album)
+                        router.push(album, onto: .home)
                     } label: {
                         friendsListeningTile(album)
                     }
@@ -506,7 +871,6 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottomLeading) {
                 ArtworkThumbnail(url: album.artwork, size: 140, isAlbum: true)
-                    .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
                 HStack(spacing: -8) {
                     ForEach(album.listeners.prefix(3)) { listener in
                         AvatarView(emoji: listener.avatarEmoji, colorHex: listener.avatarColor, size: 22)
@@ -515,7 +879,10 @@ struct HomeView: View {
                 }
                 .padding(6)
             }
-            MarqueeText(text: album.albumName, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+            HStack(spacing: 4) {
+                MarqueeText(text: album.albumName, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+                if album.isExplicit { ExplicitBadge() }
+            }
             Text(friendsListeningCaption(album.listeners))
                 .font(Font.nodalong.caption2)
                 .foregroundStyle(Color.nodalong.textSecondary)
@@ -524,31 +891,17 @@ struct HomeView: View {
         .frame(width: 140, alignment: .leading)
         // Same per-tile prefetch as Jump Back In — see that tile's comment.
         .task(id: album.id) {
-            await prefetchAlbumResolve(id: album.id, uri: album.uri, isrc: album.isrc, albumName: album.albumName, artistName: album.artistName, trackTitle: album.trackTitle)
+            guard playerVM.activeService == .appleMusic else { return }
+            await CatalogPrefetch.albumResolve(key: album.id, uri: album.uri, isrc: album.isrc,
+                                               albumName: album.albumName, artistName: album.artistName,
+                                               trackTitle: album.trackTitle, artwork: album.artwork,
+                                               service: musicService)
         }
     }
 
     private func friendsListeningCaption(_ listeners: [FriendListener]) -> String {
         guard let first = listeners.first else { return "" }
         return listeners.count == 1 ? first.username : "\(listeners.count) friends this week"
-    }
-
-    /// Shared by both `recentAlbumTile` and `friendsListeningTile`'s
-    /// per-tile prefetch — warms `MusicDetailCache.resolvedAlbum` (the
-    /// `resolveAlbum` OUTCOME, not just the eventual tracks) so a tile's
-    /// real tap, once it arrives, hits a cache instead of resolving cold.
-    /// `.utility` + a short delay for the same reason as the other
-    /// browse-time prefetch on this screen: convenience prefetch for
-    /// content that hasn't been tapped yet shouldn't compete with
-    /// higher-priority work, particularly for the first visible batch of
-    /// tiles rendered right as Home mounts.
-    private func prefetchAlbumResolve(id: String, uri: String, isrc: String?, albumName: String, artistName: String, trackTitle: String) async {
-        guard playerVM.activeService == .appleMusic else { return }
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-        guard !Task.isCancelled else { return }
-        _ = await MusicDetailCache.shared.resolvedAlbum(forKey: id) {
-            await musicService.resolveAlbum(catalogTrackId: uri, isrc: isrc, title: albumName, artist: artistName, trackTitle: trackTitle)
-        }
     }
 
     // MARK: - Most nodded this week
@@ -584,7 +937,6 @@ struct HomeView: View {
                 .foregroundStyle(Color.nodalong.textSecondary)
                 .frame(width: 16, alignment: .trailing)
             ArtworkThumbnail(url: post.artwork, size: 40, isTrack: true)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
             // `.frame(maxWidth: .infinity)` — without it this VStack just
             // hugs its own natural (never-overflowing) width and the nod
             // count ends up wherever that leaves it, rather than pinned to
@@ -617,15 +969,30 @@ struct HomeView: View {
     /// solo. Hidden entirely (via the `if !homeVM.liveNow.isEmpty` guard in
     /// `body`) when nobody's live, per the agreed design.
     private var liveNowRail: some View {
+        liveNowScroll
+            // Each tile opens that person's profile — warm them while visible.
+            .task(id: homeVM.liveNow.map(\.uid)) {
+                guard let me = authVM.currentUser?.uid else { return }
+                SocialCache.shared.prefetch(uids: homeVM.liveNow.map(\.uid), viewerUid: me)
+            }
+    }
+
+    private var liveNowScroll: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 16) {
                 ForEach(homeVM.liveNow) { entry in
-                    Button {
-                        Task { await openLiveNowEntry(entry) }
-                    } label: {
-                        liveNowTile(entry)
+                    VStack(spacing: 6) {
+                        Button {
+                            Task { await openLiveNowEntry(entry) }
+                        } label: {
+                            liveNowTile(entry)
+                        }
+                        .buttonStyle(.plain)
+                        if case .listening(_, let isPreview) = entry.kind {
+                            TuneInButton(uid: entry.uid, username: entry.username,
+                                         isPreviewPlayback: isPreview, compact: true)
+                        }
                     }
-                    .buttonStyle(.plain)
                 }
             }
             .padding(.horizontal, 16)
@@ -670,37 +1037,13 @@ struct HomeView: View {
         guard !isResolvingLiveNowUser else { return }
         isResolvingLiveNowUser = true
         defer { isResolvingLiveNowUser = false }
-        if let profile = try? await getUserProfile(uid: entry.uid) {
-            router.homePath.append(profile)
+        if let profile = await profileForNavigation(uid: entry.uid, viewerUid: authVM.currentUser?.uid) {
+            router.push(profile, onto: .home)
         }
     }
 
     // MARK: - Top Charts
 
-    /// Global/storefront trending songs — the one section with zero
-    /// personalization, distinct from every other "about you" section on
-    /// this screen. Tapping a tile plays the whole chart in context, same
-    /// pattern as an album's track list.
-    private var topChartsRail: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(alignment: .top, spacing: 12) {
-                ForEach(Array(homeVM.topChartSongs.enumerated()), id: \.element.id) { index, song in
-                    Button {
-                        guard activeService.isAuthenticated else { return }
-                        Task { await playerVM.play(homeVM.topChartSongs, startingAt: index) }
-                    } label: {
-                        topChartTile(song, rank: index + 1)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(12)
-        }
-        .gatesMarqueeToScrollSettle()
-        .background(Color.nodalong.bgCard)
-        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
-        .padding(.horizontal, 16)
-    }
 
     private func topChartTile(_ song: Song, rank: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -740,7 +1083,7 @@ struct HomeView: View {
             LazyHStack(alignment: .top, spacing: 12) {
                 ForEach(homeVM.madeForYouPlaylists) { playlist in
                     Button {
-                        router.homePath.append(playlist)
+                        router.push(playlist, onto: .home)
                     } label: {
                         madeForYouTile(playlist)
                     }
@@ -774,7 +1117,7 @@ struct HomeView: View {
         // reserves its full height without showing visible text.
         VStack(alignment: .leading, spacing: 6) {
             ArtworkThumbnail(url: playlist.artwork, size: 140)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous))
             MarqueeText(text: playlist.name, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
             Text(playlist.curatorName.isEmpty ? " " : playlist.curatorName)
                 .font(Font.nodalong.caption2)
@@ -782,6 +1125,132 @@ struct HomeView: View {
                 .lineLimit(1)
         }
         .frame(width: 140, alignment: .leading)
+        // Warm the playlist's tracks while the tile is on screen, so tapping it
+        // opens a populated list. Per-tile: only tiles that linger cost anything.
+        .task(id: playlist.id, priority: .utility) {
+            guard playerVM.activeService == .appleMusic else { return }
+            await CatalogPrefetch.playlist(id: playlist.id, service: musicService)
+        }
+    }
+
+    // MARK: - New Releases (from Shelf artists)
+
+    /// Wraps each tile in `NavigationLink(value: album)` — `AlbumResult` is a
+    /// destination this stack registers, so no navigation wiring of its own.
+    /// It does NOT render through `AlbumsCarousel` (whose per-tile prefetch
+    /// this comment used to claim), so it carries its own — New Releases and
+    /// New Music Daily both render here and were opening cold.
+    /// Shows each release's date rather than just the artist. `latestRelease`
+    /// cannot distinguish a new record from a reissue (see `getNewReleases`),
+    /// so surfacing the date is what keeps a survivor of that guard legible
+    /// instead of mysterious — a 2016 album dated three days ago at least
+    /// explains itself.
+    private func releaseRail(_ albums: [AlbumResult]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(albums) { album in
+                    NavigationLink(value: album) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ArtworkThumbnail(url: album.artwork, size: 140, isAlbum: true)
+                            HStack(spacing: 4) {
+                                MarqueeText(text: album.name, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+                                if album.isExplicit { ExplicitBadge() }
+                            }
+                            Text(album.artistName)
+                                .font(Font.nodalong.caption2)
+                                .foregroundStyle(Color.nodalong.textSecondary)
+                                .lineLimit(1)
+                            Text(relativeReleaseLabel(album.releaseDate))
+                                .font(Font.nodalong.caption2)
+                                .foregroundStyle(Color.nodalong.textTertiary)
+                                .lineLimit(1)
+                        }
+                        .frame(width: 140, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .task(id: album.id, priority: .utility) { await prefetchAlbum(album) }
+                }
+            }
+            .padding(12)
+        }
+        .background(Color.nodalong.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+        .padding(.horizontal, 16)
+        .gatesMarqueeToScrollSettle()
+    }
+
+    /// Per-tile catalog prefetch for a known `AlbumResult` — the same call
+    /// `AlbumsCarousel` makes for each of its tiles.
+    private func prefetchAlbum(_ album: AlbumResult) async {
+        guard playerVM.activeService == .appleMusic else { return }
+        await CatalogPrefetch.album(id: album.id, name: album.name, artwork: album.artwork,
+                                    releaseDate: album.releaseDate, artist: album.artistName,
+                                    service: musicService)
+    }
+
+    private func relativeReleaseLabel(_ releaseDate: String) -> String {
+        guard let date = Self.releaseDateFormatter.date(from: releaseDate) else { return "" }
+        let days = Calendar.current.dateComponents([.day], from: date, to: Date()).day ?? 0
+        switch days {
+        case ..<1:  return "Out today"
+        case 1:     return "Yesterday"
+        case ..<7:  return "\(days) days ago"
+        case ..<14: return "Last week"
+        default:    return "\(days / 7) weeks ago"
+        }
+    }
+
+    // MARK: - Recently Played (Apple's own containers)
+
+    /// Apple's recently-played albums, minus anything Jump Back In is already
+    /// showing.
+    ///
+    /// The two rails answer the same question from different sources and
+    /// would otherwise sit next to each other showing the same covers. Jump
+    /// Back In is Nodalong's own (Firestore posts grouped into albums, so it
+    /// works across devices and feeds the social graph); this is Apple's,
+    /// which additionally knows about listening that never went through
+    /// Nodalong. Deduping leaves exactly the difference — the off-app
+    /// listening — which is the only part worth a second rail. If there is
+    /// no difference the section has nothing in it and hides itself.
+    private var recentlyPlayedUnseen: [AlbumResult] {
+        let known = Set(homeVM.recentAlbums.map { albumMatchKey($0.albumName) })
+        return homeVM.recentlyPlayedAlbums.filter { !known.contains(albumMatchKey($0.name)) }
+    }
+
+
+    // MARK: - City / genre charts
+
+    /// Shared by the city and genre charts. No rank badge: a narrower chart
+    /// is about what's playing near you or in what you listen to, not about
+    /// the ranking itself. (The global Daily Top rail that did carry ranks was
+    /// retired — it overlapped the city chart almost entirely.)
+    private func chartRail(_ songs: [Song]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(Array(songs.enumerated()), id: \.offset) { index, song in
+                    Button {
+                        Task { await playerVM.play(songs, startingAt: index) }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ArtworkThumbnail(url: song.artwork, size: 140, isTrack: true)
+                            MarqueeText(text: song.title, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+                            Text(song.artist)
+                                .font(Font.nodalong.caption2)
+                                .foregroundStyle(Color.nodalong.textSecondary)
+                                .lineLimit(1)
+                        }
+                        .frame(width: 140, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(12)
+        }
+        .background(Color.nodalong.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+        .padding(.horizontal, 16)
+        .gatesMarqueeToScrollSettle()
     }
 
     // MARK: - Recently Added (Shelf)
@@ -807,8 +1276,10 @@ struct HomeView: View {
     private func recentlyAddedShelfTile(_ group: AlbumGroup) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             ArtworkThumbnail(url: group.artwork, size: 140, isAlbum: true)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
-            MarqueeText(text: group.albumName, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+            HStack(spacing: 4) {
+                MarqueeText(text: group.albumName, font: Font.nodalong.captionSemibold, color: Color.nodalong.textPrimary)
+                if group.isExplicit { ExplicitBadge() }
+            }
             Text(group.artistName)
                 .font(Font.nodalong.caption2)
                 .foregroundStyle(Color.nodalong.textSecondary)
@@ -829,18 +1300,28 @@ struct HomeView: View {
 /// track list + play-in-context + remove-from-shelf.
 private struct ShelfAlbumQuickView: View {
     let group: AlbumGroup
+    @EnvironmentObject private var router:    AppRouter
     @EnvironmentObject private var playerVM:  PlayerViewModel
     @Environment(FirebaseAuthViewModel.self) private var authVM
     @EnvironmentObject private var libraryVM: LibraryViewModel
     @EnvironmentObject private var musicService:   AppleMusicService
     @EnvironmentObject private var spotifyService: SpotifyMusicService
     @Environment(\.dismiss) private var dismiss
+    /// Real catalog artist behind the tappable artist name, once the
+    /// speculative resolve lands — pushed directly so the tap skips
+    /// `ResolvingArtistsView` entirely. See `CatalogPrefetch.artistByName`.
+    @State private var resolvedArtist: ArtistResult?
+    /// Other editions of this release. Like Shelf's own album screen, this is
+    /// a library grouping (`AlbumGroup`) with no catalog identity, so it
+    /// depends on resolving the catalog album first.
+    @State private var alternates: [AlbumResult] = []
 
     private var activeService: any MusicService {
         activeMusicService(playerVM: playerVM, apple: musicService, spotify: spotifyService)
     }
 
     var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
             VStack(spacing: 0) {
                 header
@@ -858,31 +1339,47 @@ private struct ShelfAlbumQuickView: View {
                 .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
                 .padding(.horizontal, 16)
 
+                if !alternates.isEmpty {
+                    AlternateVersionsSection(alternates: alternates)
+                }
+
                 if playerVM.nowPlaying != nil {
                     Color.clear.frame(height: 70)
                 }
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Color.nodalong.bgBase)
-        .navigationTitle(group.albumName)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Menu {
-                    Button(role: .destructive) {
-                        guard let uid = authVM.currentUser?.uid else { return }
-                        Task {
-                            await libraryVM.removeAlbum(uid: uid, tracks: group.tracks)
-                            dismiss()
-                        }
-                    } label: {
-                        Label("Remove from Shelf", systemImage: "trash")
+        }
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        // No title — `header` below already shows the album name.
+        .screenControls {
+            Menu {
+                Button(role: .destructive) {
+                    guard let uid = authVM.currentUser?.uid else { return }
+                    Task {
+                        await libraryVM.removeAlbum(uid: uid, tracks: group.tracks)
+                        dismiss()
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .foregroundStyle(Color.nodalong.purpleAccent)
+                    Label("Remove from Shelf", systemImage: "trash")
                 }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .foregroundStyle(Color.nodalong.purpleAccent)
+            }
+        }
+        // The artist name below the artwork is tappable (added with this
+        // screen's artist tap-through) — warm the artist it pushes to.
+        .task(id: group.key, priority: .utility) {
+            guard playerVM.activeService == .appleMusic else { return }
+            async let artist = CatalogPrefetch.artistByName(group.artistName, service: musicService)
+            async let catalogAlbum = CatalogPrefetch.albumByName(
+                name: group.albumName, artist: group.artistName, service: musicService)
+            let (a, al) = await (artist, catalogAlbum)
+            resolvedArtist = a
+            if let al {
+                alternates = await CatalogPrefetch.alternates(for: al, service: musicService)
             }
         }
     }
@@ -890,16 +1387,29 @@ private struct ShelfAlbumQuickView: View {
     private var header: some View {
         let size = ScreenMetrics.bounds.width - 64
         return VStack(spacing: 12) {
-            ArtworkThumbnail(url: group.artwork, size: size, isAlbum: true)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
+            // Same album-detail hero role as Shelf's own `AlbumDetailView`
+            // and `AlbumDetailSearchView` — so it gets the same idle rock +
+            // tap-to-flip disc. See `VinylArtworkView.flipsOnTap`.
+            ArtworkThumbnail(url: group.artwork, size: size, isAlbum: true, flipsOnTap: true)
             VStack(spacing: 4) {
-                Text(group.albumName)
-                    .font(Font.nodalong.title3Bold)
-                    .foregroundStyle(Color.nodalong.textPrimary)
-                    .multilineTextAlignment(.center)
+                HStack(spacing: 4) {
+                    Text(group.albumName)
+                        .font(Font.nodalong.title3Bold)
+                        .foregroundStyle(Color.nodalong.textPrimary)
+                        .multilineTextAlignment(.center)
+                    if group.isExplicit { ExplicitBadge() }
+                }
+                // Artist tap-through, matching Shelf's own album screen.
+                // Pushes the app-wide `PendingArtistResolve` marker (already
+                // registered on Home's stack for the player/party artist tap)
+                // rather than a Home-local one, so this goes through the
+                // precise MusicKit `Song.artists` relationship lookup instead
+                // of a fuzzy name search.
                 Text(group.artistName)
                     .font(Font.nodalong.subheadlineMedium)
-                    .foregroundStyle(Color.nodalong.textSecondary)
+                    .foregroundStyle(Color.nodalong.purpleAccent)
+                    .contentShape(.rect)
+                    .onTapGesture { pushArtist() }
                 Text("\(group.trackCount) track\(group.trackCount == 1 ? "" : "s")")
                     .font(Font.nodalong.caption)
                     .foregroundStyle(Color.nodalong.textSecondary)
@@ -907,6 +1417,36 @@ private struct ShelfAlbumQuickView: View {
             .padding(.horizontal, 16)
         }
         .padding(.vertical, 24)
+    }
+
+    /// Resolves the album's credited artist from a representative saved
+    /// track. `catalogId:` is deliberately fed `track.uri` — the track's REAL
+    /// Apple Music catalog id — not `track.catalogId`, which is Nodalong's
+    /// own Firestore id and always misses a direct catalog lookup (the same
+    /// distinction Home's `RecentAlbum` destination already documents).
+    private func pushArtist() {
+        // Straight to the artist when the speculative resolve has landed —
+        // no `ResolvingArtistsView` in between.
+        // Identity-carrying like every other artist push, so this
+        // participates in the router's dedup and its artist→artist
+        // replacement rather than being a blind spot.
+        let identity = NavIdentity.artist(name: group.artistName)
+        if let resolvedArtist {
+            router.push(resolvedArtist, identity: identity, onto: .home)
+            return
+        }
+        guard let track = group.tracks.first else { return }
+        router.push(
+            PendingArtistResolve(
+                trackTitle: track.title,
+                artist:     group.artistName,
+                catalogId:  track.uri,
+                isrc:       track.isrc,
+                uri:        track.uri
+            ),
+            identity: identity,
+            onto: .home
+        )
     }
 
     private func trackRow(_ track: LibraryTrackDoc, at index: Int) -> some View {
@@ -933,12 +1473,7 @@ private struct ShelfAlbumQuickView: View {
             }
             TrackActionsMenuButton(
                 song:         .from(libraryTrack: track),
-                onAddToQueue: { playerVM.addToQueue(.from(libraryTrack: track)) },
-                onToggleLike: {
-                    guard let uid = authVM.currentUser?.uid else { return }
-                    Task { await libraryVM.toggleLibrary(uid: uid, track: track) }
-                },
-                isLiked: true
+                onAddToQueue: { playerVM.addToQueue(.from(libraryTrack: track)) }
             )
         }
         .padding(.horizontal, 16)
@@ -955,8 +1490,454 @@ private struct ShelfAlbumQuickView: View {
 /// section — see `HomeView.recommendedSection`.
 struct SeeAllRecommendations: Hashable {}
 
+/// One destination for every capped rail on Home.
+///
+/// Before this, only "Recommended for You" had a see-all
+/// (`SeeAllRecommendations`); Jump Back In, Top Charts, Friends are
+/// listening, Most nodded and Recently Added all truncated at 10 with no way
+/// to reach the rest.
+struct HomeSeeAll: Hashable {
+    let section: HomeSectionID
+}
+
+// MARK: - Manage sections
+
+/// Restores hidden sections and unpins pinned ones.
+///
+/// Hiding a section from its own header is a one-way door without this — the
+/// header you'd long-press to get it back is exactly the thing that's gone.
+struct HomeLayoutSheet: View {
+    @EnvironmentObject private var homeLayout: HomeLayoutPreferences
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(HomeSectionID.allCases.sorted { $0.baseRank < $1.baseRank }, id: \.self) { id in
+                        row(id)
+                    }
+                } footer: {
+                    Text("Sections with something new today move to the top on their own. Pinning one keeps it there regardless.")
+                        .font(Font.nodalong.caption)
+                }
+
+                if !homeLayout.pinned.isEmpty || !homeLayout.hidden.isEmpty {
+                    Section {
+                        Button("Reset to default", role: .destructive) { homeLayout.resetAll() }
+                    }
+                }
+            }
+            .navigationTitle("Home sections")
+            .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ id: HomeSectionID) -> some View {
+        HStack {
+            Text(id.title)
+            Spacer()
+            if id.isHideable {
+                Button {
+                    homeLayout.togglePin(id)
+                } label: {
+                    Image(systemName: homeLayout.isPinned(id) ? "pin.fill" : "pin")
+                }
+                .buttonStyle(.borderless)
+                Toggle("", isOn: Binding(
+                    get: { !homeLayout.isHidden(id) },
+                    set: { homeLayout.setHidden(id, !$0) }
+                ))
+                .labelsHidden()
+            } else {
+                // Jump Back In: the one section that keeps Home usable with
+                // an empty follow graph and no subscription.
+                Text("Always shown")
+                    .font(Font.nodalong.caption)
+                    .foregroundStyle(Color.nodalong.textTertiary)
+            }
+        }
+    }
+}
+
 #if DEBUG
 #Preview {
     HomeView().withPreviewEnvironment()
 }
 #endif
+
+
+// MARK: - Generated playlists ("made for you, by real people")
+
+extension HomeView {
+
+    /// Which lenses to offer. `nearby` is hidden outright without a location fix
+    /// rather than shown as a dead tile or a permission nag — the other lenses
+    /// still work, and the blend just draws from the remaining pools.
+    var availableLenses: [PlaylistLens] {
+        PlaylistLens.allCases.filter { lens in
+            // `.taste` is catalog-sourced, so it cannot sit under a heading
+            // that promises real people. It has its own section.
+            guard !lens.isCatalogSourced else { return false }
+            return lens != .nearby || (locationService.geohash?.isEmpty == false)
+        }
+    }
+
+    /// `availableLenses` minus any whose built playlist is (nearly) a copy of an
+    /// earlier tile's. With one follow, "From Your Circle" and "They Liked Yours"
+    /// were the identical 25 tracks under two names. Display only: the hidden
+    /// lens is still rebuilt, so it comes back once it has something of its own.
+    var displayedLenses: [PlaylistLens] {
+        var seen: [Set<String>] = []
+        return availableLenses.filter { lens in
+            guard let p = generatedPlaylist(for: lens),
+                  let tracks = PlaylistTracksCache.freshTracks(for: p), !tracks.isEmpty else { return true }
+            let ids = Set(tracks.map(\.catalogId))
+            let isCopy = seen.contains { Double(ids.intersection($0).count) / Double(ids.count) >= 0.8 }
+            if !isCopy { seen.append(ids) }
+            return !isCopy
+        }
+    }
+
+    func generatedPlaylist(for lens: PlaylistLens, genre: String? = nil, variant: String? = nil) -> Playlist? {
+        playlistsVM.playlists.first {
+            $0.source == .generated && $0.lens == lens && $0.genre == genre && $0.variant == variant
+        }
+    }
+
+    /// Every tile Home is showing, in on-screen order — what the background pass
+    /// should make sure has a playlist behind it. One source of truth shared with
+    /// the tiles themselves.
+    var wantedPlaylists: [PlaylistGenerator.Wanted] {
+        var out: [PlaylistGenerator.Wanted] = availableLenses.map { .people($0) }
+        out.append(.catalog(.discovery(genre: nil)))
+        out.append(contentsOf: discoveryGenres.map { .catalog(.discovery(genre: $0)) })
+        out.append(.catalog(.deepCuts))
+        out.append(.catalog(.newFromSimilar))
+        out.append(contentsOf: becauseArtists.map {
+            .catalog(.becauseArtist(key: primaryArtist($0).lowercased(), name: $0))
+        })
+        return out
+    }
+
+    /// The artists offered a "Because you listen to X" tile — your three most
+    /// saved, by Shelf tracks.
+    var becauseArtists: [String] {
+        libraryVM.artistEntries
+            // An empty-artist bucket is named "Unknown Artist"; it isn't an artist.
+            .filter { !$0.name.isEmpty && $0.name != "Unknown Artist" }
+            .sorted { $0.trackCount > $1.trackCount }
+            .prefix(3)
+            .map(\.name)
+    }
+
+    /// The genres worth offering a discovery playlist for — the user's own
+    /// top few by track count.
+    ///
+    /// Capped at 3. Each one is a full taste run (a similarity expansion plus
+    /// album fetches across a dozen artists), so this is a real cost per tile
+    /// — and past three the rail stops being "your genres" and turns into a
+    /// genre directory, which Search already isn't doing well enough to be
+    /// worth duplicating here.
+    var discoveryGenres: [String] {
+        libraryVM.discoverableGenreEntries
+            .prefix(3)
+            .map(\.name)
+    }
+
+    @ViewBuilder
+    var madeByPeopleSection: some View {
+        section(.madeByPeople) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(displayedLenses, id: \.self) { lens in
+                        lensTile(lens)
+                    }
+                }
+                .padding(12)
+            }
+            .overlay(alignment: .bottom) { generationNotice }
+            .background(Color.nodalong.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+            .padding(.horizontal, 16)
+            .gatesMarqueeToScrollSettle()
+        }
+        // The `.task { await loadAndRefreshGenerated() }` that used to live
+        // here moved to `HomeView.body`. This section can now sit below the
+        // fold in a lazy stack and never render, which would leave `playlistsVM`
+        // permanently unloaded on Home — the exact bug that trigger exists
+        // to prevent.
+    }
+
+    /// Populates the tiles, then rebuilds anything gone stale.
+    ///
+    /// The load matters on its own: nothing else on Home touches
+    /// `playlistsVM`, so without this the tiles would render as
+    /// "not generated yet" on a fresh launch even when the playlists exist.
+    /// `load` is guarded by `loadedForUid`, so calling it here is cheap.
+    func loadAndRefreshGenerated() async {
+        guard let me = authVM.profile else { return }
+        await playlistsVM.load(uid: me.uid)
+        // Generation needs your library; make sure it's in before starting (a
+        // guarded no-op if it already is).
+        await libraryVM.load(uid: me.uid)
+        // Pre-saved albums whose release date has passed fill in by themselves.
+        await ReleaseWatch.checkDue(musicService: musicService, libraryVM: libraryVM)
+        let rebuilt = await generator.refreshAndBuildIfNeeded(
+            existing: playlistsVM.playlists,
+            wanted: wantedPlaylists,
+            me: me,
+            myLibrary: libraryVM.tracks,
+            myGeohash: locationService.geohash,
+            musicService: musicService
+        )
+        // Pick up whatever the pass built. No navigation — an automatic
+        // build must never yank the user into a playlist they didn't open.
+        if rebuilt { await playlistsVM.reload(uid: me.uid) }
+        // Fetch the track list of any generated playlist whose cached version is
+        // out of date, so opening it later shows tracks immediately. Costs
+        // nothing on a launch where nothing was rebuilt.
+        await PlaylistTracksCache.warm(playlistsVM.playlists)
+    }
+
+    /// Why the last generation produced nothing, or what went wrong.
+    ///
+    /// Without this the generator's carefully-worded reasons ("Nobody has
+    /// nodded your tracks yet") were written and never read — a tap on an empty
+    /// lens just spun and silently reverted, with no way to tell whether it
+    /// failed or there was genuinely nothing to build.
+    @ViewBuilder
+    var generationNotice: some View {
+        if let notice = generator.emptyReason ?? generator.errorMessage {
+            Text(notice)
+                .font(Font.nodalong.caption)
+                .foregroundStyle(Color.nodalong.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
+                .background(.ultraThinMaterial)
+                .transition(.opacity)
+        }
+    }
+
+    /// Deliberately its own section rather than a fifth tile in
+    /// `madeByPeopleSection`: that rail is titled "Made for you, by real
+    /// people", and this one is built from the catalog. One tile, because
+    /// there is only ever one of it.
+    @ViewBuilder
+    var tasteSection: some View {
+        section(.foundForYou) {
+            VStack(alignment: .leading, spacing: 0) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 12) {
+                        tasteTile(.discovery(genre: nil))
+                        // One per top genre. The general tile stays: a
+                        // cross-genre suggestion is a different thing from
+                        // "more of the hip-hop you already play", and losing
+                        // it would narrow discovery to what you listen to
+                        // most — the opposite of the point.
+                        // A genre playlist that came out tiny isn't worth a tile.
+                        ForEach(discoveryGenres.filter { g in
+                            (generatedPlaylist(for: .taste, genre: g)?.trackCount ?? Int.max) >= PlaylistGenerator.minGenrePlaylistSize
+                        }, id: \.self) { tasteTile(.discovery(genre: $0)) }
+                        // Different jobs from the discovery tiles above: your own
+                        // artists' unheard songs, what's new from artists like
+                        // yours, and discovery from one artist at a time.
+                        tasteTile(.deepCuts)
+                        tasteTile(.newFromSimilar)
+                        ForEach(becauseArtists, id: \.self) { name in
+                            tasteTile(.becauseArtist(key: primaryArtist(name).lowercased(), name: name))
+                        }
+                    }
+                    .padding(12)
+                }
+                if let reason = generator.emptyReason, generator.tasteBusyKey == nil {
+                    Text(reason)
+                        .font(Font.nodalong.caption)
+                        .foregroundStyle(Color.nodalong.textSecondary)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 12)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.nodalong.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+            .padding(.horizontal, 16)
+            .gatesMarqueeToScrollSettle()
+        }
+    }
+
+    /// A taste tile — the general one when `genre` is nil, otherwise that
+    /// genre's. Deliberately its own builder rather than an overload of
+    /// `lensTile`: the people-lenses are one-per-lens and keyed on the enum,
+    /// while these are many-per-lens and keyed on `(lens, genre)`.
+    @ViewBuilder
+    func tasteTile(_ mode: PlaylistGenerator.CatalogMode) -> some View {
+        let existing = generatedPlaylist(for: mode.lens, genre: mode.genre, variant: mode.variant)
+        let busy = generator.isGeneratingCatalog(mode)
+
+        Button {
+            if let existing, !busy {
+                router.push(existing, onto: .home)
+            } else if !busy {
+                Task { await runTasteGeneration(mode) }
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack {
+                    ArtworkThumbnail(url: existing?.coverArtwork ?? "", size: 140)
+                        .clipShape(RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous))
+                    if busy {
+                        RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous)
+                            .fill(Color.black.opacity(0.45))
+                        ProgressView().tint(Color.nodalong.textOnAccent)
+                    } else if existing == nil {
+                        RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous)
+                            .fill(Color.nodalong.bgElevated)
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundStyle(Color.nodalong.purpleAccent)
+                    }
+                }
+                .frame(width: 140, height: 140)
+
+                Text(tasteTileTitle(mode))
+                    .font(Font.nodalong.custom(13, .bold))
+                    .foregroundStyle(Color.nodalong.textPrimary)
+                    .lineLimit(1)
+
+                Text(tasteTileSubtitle(mode, existing: existing, busy: busy))
+                    .font(Font.nodalong.custom(11))
+                    .foregroundStyle(Color.nodalong.textTertiary)
+                    .lineLimit(2)
+                    .frame(height: 28, alignment: .top)
+            }
+            .frame(width: 140, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+    }
+
+    func tasteTileTitle(_ mode: PlaylistGenerator.CatalogMode) -> String {
+        switch mode {
+        case .discovery(let genre):      return genre.map { "\($0) Discoveries" } ?? PlaylistLens.taste.title
+        case .deepCuts:                  return PlaylistLens.deepCuts.title
+        case .newFromSimilar:            return PlaylistLens.newFromSimilar.title
+        case .becauseArtist(_, let name): return "Because you listen to \(name)"
+        }
+    }
+
+    func tasteTileSubtitle(_ mode: PlaylistGenerator.CatalogMode, existing: Playlist?, busy: Bool) -> String {
+        if busy { return "Building…" }
+        guard let existing else {
+            switch mode {
+            case .discovery(let genre):
+                return genre.map { "Deep cuts next to the \($0) you play" } ?? PlaylistLens.taste.tagline
+            case .deepCuts:                  return PlaylistLens.deepCuts.tagline
+            case .newFromSimilar:            return PlaylistLens.newFromSimilar.tagline
+            case .becauseArtist(_, let name): return "More like \(name)"
+            }
+        }
+        if let description = existing.description, !description.isEmpty { return description }
+        return "\(existing.trackCount) tracks"
+    }
+
+    @ViewBuilder
+    func lensTile(_ lens: PlaylistLens) -> some View {
+        let existing = generatedPlaylist(for: lens)
+        let busy = generator.isGenerating(lens)
+
+        Button {
+            if let existing, !busy {
+                router.push(existing, onto: .home)
+            } else {
+                Task { await runGeneration(lens) }
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack {
+                    ArtworkThumbnail(url: existing?.coverArtwork ?? "", size: 140)
+                        .clipShape(RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous))
+                    if busy {
+                        RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous)
+                            .fill(Color.black.opacity(0.45))
+                        ProgressView().tint(Color.nodalong.textOnAccent)
+                    } else if existing == nil {
+                        RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous)
+                            .fill(Color.nodalong.bgElevated)
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundStyle(Color.nodalong.purpleAccent)
+                    }
+                }
+                .frame(width: 140, height: 140)
+
+                Text(lens.title)
+                    .font(Font.nodalong.custom(13, .bold))
+                    .foregroundStyle(Color.nodalong.textPrimary)
+                    .lineLimit(1)
+
+                Text(tileSubtitle(lens: lens, existing: existing, busy: busy))
+                    .font(Font.nodalong.custom(11))
+                    .foregroundStyle(Color.nodalong.textTertiary)
+                    .lineLimit(2)
+                    .frame(height: 28, alignment: .top)
+            }
+            .frame(width: 140, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+    }
+
+    /// Prefer naming the people over counting the tracks. "25 tracks" is what an
+    /// algorithm's shelf says; "From Aidooo, who you follow" is the whole point
+    /// of this section. Falls back to the count for playlists generated before
+    /// descriptions named anyone.
+    func tileSubtitle(lens: PlaylistLens, existing: Playlist?, busy: Bool) -> String {
+        if busy { return "Building…" }
+        guard let existing else { return lens.tagline }
+        if let description = existing.description, !description.isEmpty { return description }
+        return "\(existing.trackCount) tracks"
+    }
+
+    /// The taste lens's own entry point. Mirrors `runGeneration` — generate,
+    /// reload so the tile updates, then open it — but calls `generateTaste`,
+    /// which takes a music service instead of a geohash.
+    func runTasteGeneration(_ mode: PlaylistGenerator.CatalogMode) async {
+        guard let me = authVM.profile else { return }
+        let id = await generator.generateCatalog(
+            mode: mode,
+            me: me,
+            myLibrary: libraryVM.tracks,
+            musicService: musicService
+        )
+        await playlistsVM.reload(uid: me.uid)
+        if id != nil, let fresh = generatedPlaylist(for: mode.lens, genre: mode.genre, variant: mode.variant) {
+            router.push(fresh, onto: .home)
+        }
+    }
+
+    func runGeneration(_ lens: PlaylistLens) async {
+        guard let me = authVM.profile else { return }
+        let id = await generator.generate(
+            lens: lens,
+            me: me,
+            myLibrary: libraryVM.tracks,
+            myGeohash: locationService.geohash
+        )
+        // Refresh so the tile picks up the new playlist without a manual pull.
+        await playlistsVM.reload(uid: me.uid)
+        if id != nil, let fresh = generatedPlaylist(for: lens) {
+            router.push(fresh, onto: .home)
+        }
+    }
+}

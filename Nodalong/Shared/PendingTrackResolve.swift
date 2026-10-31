@@ -35,7 +35,20 @@ struct PendingAlbumResolve: Hashable {
     let catalogId: String?
     let isrc: String?
     let uri: String
+    /// The TRACK's own title. `resolveAlbum`'s fallback is a song search,
+    /// and without this it searched for a song named after the ALBUM — the
+    /// same mistake fixed for Home on 2026-08-19, still live on this path
+    /// (a cold album tap from the player or the "…" menu).
+    var trackTitle: String? = nil
 }
+
+/// `MusicDetailCache` key for a track-anchored resolve (an album or artist
+/// tap that starts from a TRACK, not a known catalog item). Keyed by the
+/// track's uri so the player's prefetch, the "…" menu's prefetch, a party's
+/// prefetch and the real tap all land on one cache entry — before, only the
+/// currently playing track was ever warm, and every other track's result
+/// was thrown away the moment it was used.
+func pendingResolveKey(_ uri: String) -> String { "pending:\(uri)" }
 
 /// Resolves the artist(s) actually credited on a track — MusicKit's exact
 /// `Song.artists` relationship on Apple Music, a fuzzy `searchAll` fallback
@@ -68,10 +81,12 @@ func resolvePendingArtists(
               let artist = results.artists.first else { return [] }
         return [artist]
     }
-    return await musicService.resolveArtists(
-        catalogTrackId: pending.catalogId, isrc: pending.isrc,
-        title: pending.trackTitle, artist: pending.artist
-    )
+    return await MusicDetailCache.shared.resolvedArtists(forKey: pendingResolveKey(pending.uri)) {
+        await musicService.resolveArtists(
+            catalogTrackId: pending.catalogId, isrc: pending.isrc,
+            title: pending.trackTitle, artist: pending.artist
+        )
+    }
 }
 
 /// Same shape for albums — currently only `NowPlayingView` has an
@@ -91,8 +106,27 @@ func resolvePendingAlbum(
         let q = "\(pending.albumName) \(pending.artist)"
         return (try? await activeService.searchAll(q, maxPerType: 1))?.albums.first
     }
-    return await musicService.resolveAlbum(
-        catalogTrackId: pending.catalogId, isrc: pending.isrc,
-        title: pending.albumName, artist: pending.artist
-    )
+    return await MusicDetailCache.shared.resolvedAlbum(forKey: pendingResolveKey(pending.uri)) {
+        await musicService.resolveAlbum(
+            catalogTrackId: pending.catalogId, isrc: pending.isrc,
+            title: pending.albumName, artist: pending.artist,
+            trackTitle: pending.trackTitle ?? ""
+        )
+    }
+}
+
+/// Synchronous cache read for a pending album tap — the player's own
+/// prefetch first, then the shared cache. For seeding a resolving screen in
+/// `init`, so a warm tap never shows its placeholder.
+@MainActor
+func cachedPendingAlbum(_ pending: PendingAlbumResolve, playerVM: PlayerViewModel) -> AlbumResult? {
+    if let cached = playerVM.prefetchedAlbumForUri, cached.uri == pending.uri { return cached.album }
+    return MusicDetailCache.peekResolvedAlbum(key: pendingResolveKey(pending.uri))
+}
+
+/// Artist twin of `cachedPendingAlbum`.
+@MainActor
+func cachedPendingArtists(_ pending: PendingArtistResolve, playerVM: PlayerViewModel) -> [ArtistResult]? {
+    if let cached = playerVM.prefetchedArtistsForUri, cached.uri == pending.uri { return cached.artists }
+    return MusicDetailCache.peekResolvedArtists(key: pendingResolveKey(pending.uri))
 }

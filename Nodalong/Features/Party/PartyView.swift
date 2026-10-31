@@ -71,6 +71,16 @@ struct PartyView: View {
     private var partyList: some View {
         List {
             nowPlayingHero
+                // A remote listener has no local `nowPlaying`, so the
+                // player's own artist prefetch never runs for them and the
+                // hero's artist tap resolved cold. The host already has it.
+                .task(id: currentTrack?.uri) {
+                    guard !partyVM.isHost, let track = currentTrack else { return }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    await CatalogPrefetch.pending(song: .from(partyQueueTrack: track),
+                                                  playerVM: playerVM, service: musicService)
+                }
                 .listRowBackground(Color.nodalong.bgBase)
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 12, trailing: 16))
                 .listRowSeparator(.hidden)
@@ -366,7 +376,7 @@ struct PartyView: View {
             if let playlist = partyVM.endedPlaylist {
                 VStack(spacing: 10) {
                     ArtworkThumbnail(url: playlist.coverArtwork, size: min(ScreenMetrics.bounds.width - 140, 240))
-                        .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous))
                     // Previously wrapped freely (no lineLimit) rather than
                     // truncating — a one-time, single-glance summary screen
                     // reads better with the same scrolling-title treatment
@@ -488,6 +498,18 @@ struct StartPartySheet: View {
                 }
                 .listRowBackground(Color.nodalong.bgCard)
 
+                // What is playing right now — the first track of the LP.
+                Section("Now Playing") {
+                    if let current = playerVM.currentItem {
+                        QueueRow(song: current.song, isCurrent: true)
+                    } else {
+                        Text("Nothing playing — you can add songs once the LP starts.")
+                            .font(Font.nodalong.subheadline)
+                            .foregroundStyle(Color.nodalong.textSecondary)
+                    }
+                }
+                .listRowBackground(Color.nodalong.bgCard)
+
                 Section("Who can add songs") {
                     Picker("Who can add", selection: $permission) {
                         Text("Anyone").tag(PartyPermission.anyoneCanAdd)
@@ -496,11 +518,26 @@ struct StartPartySheet: View {
                     .pickerStyle(.segmented)
                 }
                 .listRowBackground(Color.nodalong.bgCard)
+
+                // Read-only: this is exactly what starting the LP shares —
+                // `createAndEnter` seeds the party with the playing track
+                // followed by this Up Next. Reorder or remove on the queue
+                // screen before starting.
+                if !playerVM.upNext.isEmpty {
+                    Section("Up Next · \(playerVM.upNext.count)") {
+                        ForEach(playerVM.upNext) { item in
+                            QueueRow(song: item.song, isCurrent: false)
+                        }
+                    }
+                    .listRowBackground(Color.nodalong.bgCard)
+                }
             }
             .scrollContentBackground(.hidden)
-            .background(Color.nodalong.bgBase)
+            .screenBackground()
             .navigationTitle("Start an LP")
             .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }.foregroundStyle(Color.nodalong.textSecondary)
@@ -579,9 +616,11 @@ struct PartyAddSheet: View {
                     .scrollContentBackground(.hidden)
                 }
             }
-            .background(Color.nodalong.bgBase)
+            .screenBackground()
             .navigationTitle("Add to Queue")
             .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }.foregroundStyle(Color.nodalong.purpleAccent)

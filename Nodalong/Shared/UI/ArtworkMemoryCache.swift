@@ -52,4 +52,36 @@ enum ArtworkMemoryCache {
     /// data, so it's safe (and desirable) to keep across an account switch.
     /// Exposed for memory-pressure handling and tests.
     static func clear() { cache.removeAllObjects() }
+
+    /// Downloads and decodes `url` at the size a destination screen will ask
+    /// for, so that screen's `CachedArtworkImage` hits on its FIRST frame.
+    ///
+    /// Data prefetching alone leaves the hero artwork cold: a tile shows the
+    /// 160/320px bucket, the screen it opens asks for 600px, and those are
+    /// different keys. The key written here is exactly the one
+    /// `CachedArtworkImage` reads, because both go through `ArtworkURL.sized`
+    /// with the same point size — its bucketing (160/320/600) is what makes
+    /// "the same size" a forgiving match.
+    @MainActor
+    static func prefetch(_ url: String, points: CGFloat) async {
+        let key = ArtworkURL.sized(url, points: points)
+        guard !key.isEmpty, image(for: key) == nil, !Task.isCancelled,
+              let u = URL(string: key),
+              let (data, _) = try? await URLSession.shared.data(from: u),
+              let raw = UIImage(data: data),
+              let decoded = await raw.byPreparingForDisplay()
+        else { return }
+        store(decoded, for: key)
+    }
+
+    /// Warms a hero that may render either way the artwork-style setting
+    /// allows: the full square at `points`, or the label of the vinyl disc
+    /// drawn at that size (`VinylArtworkView` — a smaller circle, so on some
+    /// devices a different bucket). When both resolve to the same key the
+    /// second call is a free cache hit.
+    @MainActor
+    static func prefetchHero(_ url: String, points: CGFloat) async {
+        await prefetch(url, points: points)
+        await prefetch(url, points: points * VinylArtworkView.discScale * VinylArtworkView.labelScale)
+    }
 }

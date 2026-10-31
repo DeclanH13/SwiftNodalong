@@ -60,7 +60,7 @@ struct NowPlayingTrack: Sendable, Equatable {
 @MainActor
 final class PlaybackClock: ObservableObject {
     /// Normalised playback position, 0–1.
-    @Published var progress: Double = 0
+    @Published var progress: Double = 0 { didSet { PublishCounter.bump("clock.progress") } }
     /// Current track length in seconds.
     @Published var duration: TimeInterval = 0
 }
@@ -115,11 +115,18 @@ final class PlayerViewModel: ObservableObject {
     /// change, regardless of how many views are watching or being recreated.
     @Published private(set) var nowPlaying: NowPlayingTrack? = nil {
         didSet {
+            PublishCounter.bump("nowPlaying")
             guard nowPlaying?.uri != oldValue?.uri else { return }
             prefetchDetailsForCurrentTrack()
+            if let art = nowPlaying?.artwork { warmHeroArtwork(art) }
         }
     }
-    @Published private(set) var isPlaying      = false
+    @Published private(set) var isPlaying      = false {
+        // Mirrors into the field log so the heartbeat and the next-launch
+        // analysis know whether the app BELIEVED it was playing. Only the
+        // boolean — see `FieldDiagnostics.swift`'s privacy contract.
+        didSet { FieldLog.setPlaying(isPlaying); PublishCounter.bump("isPlaying") }
+    }
     /// Speculative artist/album resolve for the currently-playing track — see
     /// `MiniPlayerBar`'s prefetch `.task`, which is what populates these.
     /// `NowPlayingView`'s own tap handlers check here first, keyed on the
@@ -129,14 +136,28 @@ final class PlayerViewModel: ObservableObject {
     @Published private(set) var prefetchedAlbumForUri:   (uri: String, album: AlbumResult)? = nil
     @Published private(set) var prefetchedArtistsForUri: (uri: String, artists: [ArtistResult])? = nil
 
+    // Both setters also seed `MusicDetailCache` under `pendingResolveKey`,
+    // so this track's answer outlives it being current — tapping its artist
+    // later from the "…" menu, a party queue or a Feed card is a hit too.
     func setPrefetchedAlbum(_ album: AlbumResult?, forUri uri: String) {
         guard let album else { return }
         prefetchedAlbumForUri = (uri, album)
+        Task { await MusicDetailCache.shared.seedResolved(album: album, artists: [], forKey: pendingResolveKey(uri)) }
     }
 
     func setPrefetchedArtists(_ artists: [ArtistResult], forUri uri: String) {
         guard !artists.isEmpty else { return }
         prefetchedArtistsForUri = (uri, artists)
+        Task { await MusicDetailCache.shared.seedResolved(album: nil, artists: artists, forKey: pendingResolveKey(uri)) }
+    }
+
+    /// Decodes `artwork` at the full player's hero size, so opening the full
+    /// player — or skipping to this track inside it — shows the artwork on
+    /// the first frame. The mini player only ever loaded a 160px rendition,
+    /// which is a different cache key.
+    private func warmHeroArtwork(_ artwork: String) {
+        guard !artwork.isEmpty else { return }
+        Task(priority: .utility) { await ArtworkMemoryCache.prefetchHero(artwork, points: NowPlayingView.heroArtworkSide) }
     }
 
     /// Fires exactly once per genuine track change (see `nowPlaying`'s
@@ -145,23 +166,62 @@ final class PlayerViewModel: ObservableObject {
     /// already-populated `prefetchedAlbumForUri`/`prefetchedArtistsForUri`
     /// instead of paying the ~260ms–1.2s resolve cascade cold.
     private func prefetchDetailsForCurrentTrack() {
+        // Debounced. This is speculation about a tap that has not happened —
+        // nobody is looking at the artist or album while the phone is locked
+        // and the user is holding ⏭. Firing it immediately on every track
+        // change meant a run of skips queued two catalog cascades PER SKIP
+        // (device logs show each taking 300–700ms), all competing with the
+        // playback resolve that actually gates audio starting. Waiting for
+        // the user to settle on a track costs nothing: if they skip past it,
+        // the work was never going to be used.
+        detailPrefetchTask?.cancel()
         guard activeService == .appleMusic, let track = nowPlaying, let service = musicService else { return }
         let uri = track.uri
-        Task { [weak self] in
+        // The debounce protects a run of lock-screen skips. Once the full
+        // player is open, the album and artist names are on screen and
+        // one tap away, so there is nothing to wait for.
+        let delay = isExpanded ? 0 : Self.detailPrefetchDelay
+        detailPrefetchWaiting = delay > 0
+        detailPrefetchTask = Task { [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            self?.detailPrefetchWaiting = false
+            guard !Task.isCancelled, self?.nowPlaying?.uri == uri else { return }
+            // Sequential, NOT concurrent. Both of these go through
+            // `AppleMusicService.resolveDetailedSong`, which memoizes a single
+            // entry — running them at once made both miss it and pay for the
+            // same lookup twice (visible in a device log as two
+            // `resolveDetailedSong('X')` lines per track). Awaiting in turn
+            // lets the second one hit the memo for free.
             if let album = await service.resolveAlbum(
                 catalogTrackId: track.catalogId, isrc: track.isrc, title: track.album, artist: track.artist,
                 trackTitle: track.title
             ) {
                 self?.setPrefetchedAlbum(album, forUri: uri)
             }
-        }
-        Task { [weak self] in
+            guard !Task.isCancelled, self?.nowPlaying?.uri == uri else { return }
             let artists = await service.resolveArtists(
                 catalogTrackId: track.catalogId, isrc: track.isrc, title: track.title, artist: track.artist
             )
             self?.setPrefetchedArtists(artists, forUri: uri)
+            // Chain into the artist's own detail. `resolveAlbum` above
+            // already warms the album's track list internally, so the album
+            // tap was a single continuous load while the artist tap showed a
+            // resolve spinner and then a second cold fetch behind it.
+            guard !Task.isCancelled, self?.nowPlaying?.uri == uri, let first = artists.first else { return }
+            // `settle: 0` — this task has already waited out its own debounce.
+            await CatalogPrefetch.artist(id: first.id, service: service, settle: 0)
         }
     }
+    private var detailPrefetchTask: Task<Void, Never>?
+    /// True only while `detailPrefetchTask` is still sleeping out its
+    /// debounce — the only phase worth restarting when the full player opens.
+    /// Restarting a resolve already in flight would just pay for it twice.
+    private var detailPrefetchWaiting = false
+    /// How long a track must stay current before its artist/album are
+    /// speculatively resolved. Long enough that a run of skips resolves
+    /// nothing, short enough to still be warm by the time anyone opens the
+    /// full player and taps.
+    private static let detailPrefetchDelay: TimeInterval = 2.0
     /// Whether the full-screen `NowPlayingView` is presented. Drives the
     /// progress-timer cadence: the full player has a scrubber that wants ~10 Hz,
     /// but the mini bar shows no progress at all, so when collapsed we poll at a
@@ -170,6 +230,13 @@ final class PlayerViewModel: ObservableObject {
     /// Restarts the timer on change.
     @Published var isExpanded = false {
         didSet {
+            FieldLog.event("player", "isExpanded \(oldValue) → \(isExpanded)")
+            // Opening the full player is the moment the album/artist names
+            // become tappable — if the debounced prefetch hasn't landed yet,
+            // restart it with no delay (see `prefetchDetailsForCurrentTrack`).
+            if isExpanded, !oldValue, detailPrefetchWaiting {
+                prefetchDetailsForCurrentTrack()
+            }
             guard oldValue != isExpanded, progressTimer != nil else { return }
             startProgressTimer()
         }
@@ -194,13 +261,67 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: - Queue
 
+    /// The single source of truth for playback order. Only ever changed by
+    /// `send(_:)`, which runs `reduceQueue` (NodalongKit) — so every rule about
+    /// what a queue edit does lives in one tested place, and the current track is
+    /// held by id, not by an index that a reorder or removal can make stale.
+    private(set) var queueState = QueueState()
     /// The full ordered queue, **including** the currently-playing item at
-    /// `currentIndex`. This is the single source of truth for playback order —
-    /// only one track is ever loaded into the underlying player at a time, so
-    /// "Up Next" lives entirely here and reorder/remove are pure array edits.
+    /// `currentIndex`. A published mirror of `queueState` for views — written
+    /// only by `syncPublishedQueue()`. Only one track is ever loaded into the
+    /// underlying player at a time, so "Up Next" lives entirely here.
     @Published private(set) var queue: [QueueItem] = []
-    /// Index of the now-playing entry within `queue`.
+    /// Index of the now-playing entry within `queue`. Mirror of `queueState`.
     @Published private(set) var currentIndex: Int = 0
+
+    /// The only way the queue changes: applies `command`, publishes the result
+    /// and persists it. Returns what the player now has to do; callers apply it
+    /// (`applyQueueEffect`), because how — awaited, detached, or via the retry
+    /// chain's own `playCurrent` — depends on the caller.
+    ///
+    /// A pure edit (no load) also gets the follow-ups every edit needs: the
+    /// native-queue / Spotify mirror and the next-track prefetch. A load does
+    /// those itself once the new track starts, so running them here too would
+    /// only race it.
+    @discardableResult
+    private func send(_ command: QueueCommand) -> QueueEffect {
+        let before = queueState.epoch
+        let effect = reduceQueue(&queueState, command)
+        guard queueState.epoch != before || effect != .none else { return .none }
+        syncPublishedQueue()
+        persistQueue()
+        if effect == .none {
+            syncSpotifyNativeQueue()
+            Task { await syncNativeQueueNeighbors() }
+            prefetchNext()
+        }
+        return effect
+    }
+
+    /// Copies `queueState` into the published mirrors, only where they changed
+    /// (each assignment re-renders every observer).
+    private func syncPublishedQueue() {
+        if queue != queueState.items { queue = queueState.items }
+        let index = queueState.currentIndex ?? 0
+        if currentIndex != index { currentIndex = index }
+    }
+
+    /// Carries out a `QueueEffect`. `.adopt` is handled by the caller, which
+    /// has the native entry it adopts.
+    private func applyQueueEffect(_ effect: QueueEffect) async {
+        switch effect {
+        case .load:
+            lastPlaybackStatus = .playing  // re-arm before playCurrent arms it again
+            await requestPlayCurrent()
+        case .restart:
+            seek(to: 0)
+        case .stop:
+            isPlaying = false
+            stopBackends()
+        case .adopt, .none:
+            break
+        }
+    }
 
     /// The entry currently playing, if any.
     var currentItem: QueueItem? {
@@ -286,11 +407,6 @@ final class PlayerViewModel: ObservableObject {
     /// `dismiss()` — all of which represent leaving the "party is the queue" model.
     /// `@Published` so the party UI reacts when it flips (changes rarely).
     @Published private(set) var isPartyDriven = false
-    /// Latest party-queue snapshot received while a `skipUnplayableAndAdvance`
-    /// retry chain was in flight — drained once the chain settles so a
-    /// mid-recursion queue/index mutation can't corrupt it, without silently
-    /// dropping the update (Firestore listeners only fire on real changes).
-    private var pendingReconcile: [NodalongKit.Song]?
 
     // MARK: - Sync follow (radio)
 
@@ -321,14 +437,72 @@ final class PlayerViewModel: ObservableObject {
     private var isPreviewMode: Bool = false
     /// End-of-item observer for the preview `AVPlayer`, removed on teardown.
     private var previewEndObserver: NSObjectProtocol?
-    /// Guards `handleTrackEnd()` against re-entry while an advance is in flight
-    /// (the progress timer can fire several times before `playCurrent` resets
-    /// progress to 0).
-    private var isAdvancing = false
     /// `true` while `playCurrent()` is resolving + establishing a track. Stops
     /// the end-of-track edge detector from mistaking the brief `.paused` state
     /// during track hand-off for a finished track and advancing prematurely.
     private var isLoadingTrack = false
+    /// Every job that touches `ApplicationMusicPlayer`'s queue — a track load or
+    /// a mirror sync — runs on this one chain, one after another.
+    ///
+    /// Loads and mirror syncs used to be serialised by two unrelated guards
+    /// (a load task chain and an `isSyncingNativeQueue` flag), so a mirror's
+    /// `insert` could still be in flight when a load assigned
+    /// `player.queue = [...]` — two concurrent native-queue mutations, the
+    /// same class as the 2026-08-07 freeze (once MusicKit's queue state is
+    /// corrupted, the next player access blocks forever in a synchronous XPC
+    /// wait on `mediaplayerd`, on the main thread). One chain makes that
+    /// impossible by construction.
+    private var nativeChain: Task<Void, Never>?
+    /// Jobs queued or running on `nativeChain`. Zero means nothing of ours is
+    /// about to change MusicKit's queue (see `isSettled`).
+    private var nativeJobs = 0
+    /// The item a queued, not-yet-started load is for — so two requests for the
+    /// same track collapse into one load.
+    private var pendingLoadTarget: UUID?
+    /// A mirror sync is waiting on the chain. At most one waits; it mirrors the
+    /// LATEST queue when its turn comes, so further requests can be dropped.
+    private var mirrorQueued = false
+    /// The item the player is actually on: set by a load that finished while
+    /// still current, or when we follow MusicKit's own move onto an item.
+    private var loadedItemID: UUID?
+    /// When the last load's `play()` returned. MusicKit blips
+    /// playing→paused→playing for a few hundred ms right after; see the
+    /// end-of-track confirmation.
+    private var lastLoadCompletedAt: Date?
+    /// Id of the native queue entry seen on the previous progress tick. The
+    /// drift detector only runs when the entry actually CHANGES.
+    private var lastSeenNativeEntryID: String?
+    /// Set by `performNativeQueueSync` when the entries ahead of MusicKit's
+    /// current one aren't, in order, the start of Up Next. After a write-ahead
+    /// it stays set — the entries the write-ahead displaced still sit behind the
+    /// correct window — so it is NOT a sign anything is wrong. Only read by the
+    /// layout-lost metadata fallback in `handleNativeMove`; the positional path
+    /// uses `nativeHopIsConsistent()` instead. Cleared by every load.
+    private var nativeQueueMirrorStale = false
+
+    /// Which of OUR items each entry in `ApplicationMusicPlayer.shared.queue.entries`
+    /// is, in the same order.
+    ///
+    /// Entries used to be recognised by their MusicKit entry id. On device,
+    /// MusicKit gives mirrored entries NEW ids by itself 0.2–3 s after they are
+    /// inserted (Phase 0 capture, 2026-10-30), so that lookup matched almost
+    /// nothing and every advance fell back to metadata matching — which can't
+    /// see a removed track or a backward move. Position is stable: we only ever
+    /// build this queue by replacing it with one track (a load) or appending at
+    /// `.tail` (the mirror), so we always know its order. nil = we lost track
+    /// (an insert landed somewhere unexpected); identification then falls back
+    /// to metadata until the next load rebuilds it. Only ever READS
+    /// `player.queue.entries` — mutating it is what froze the app.
+    private var nativeLayout: [UUID]? = []
+    /// When we first noticed the player sitting stopped while we still
+    /// believe we are playing. See the progress timer's stalled-state
+    /// reconciliation for why that can happen at all.
+    private var believedPlayingButStoppedSince: Date?
+    /// When MusicKit's status last became `.interrupted` (a call, Siri, another
+    /// app taking the audio) — nil when it isn't. Used to resume once the
+    /// interruption ends; see the `.interrupted → .paused` handling in the
+    /// progress timer.
+    private var interruptedSince: Date?
     /// `true` when a remote (Control Center / headphone) pause arrives while a
     /// track transition is already in flight (`isLoadingTrack == true`) — e.g.
     /// the user pauses right as the current track naturally ends and the
@@ -382,6 +556,11 @@ final class PlayerViewModel: ObservableObject {
         explicitPauseLock.lock(); _lastExplicitPauseAt = Date(); explicitPauseLock.unlock()
     }
     private static let explicitPauseGraceWindow: TimeInterval = 2.0
+    /// When the user last tapped pause or play in the app. Unlike
+    /// `lastExplicitPauseAt` it isn't cleared by a resume, so the end-of-track
+    /// confirmation can tell that a stop edge is MusicKit catching up with a tap
+    /// moments earlier (rapid pause/play, device log 18:51:46).
+    private var lastToggleAt: Date?
     /// The last `player.playbackTime` observed while `state.playbackStatus`
     /// was genuinely `.playing`, updated every progress-timer tick. Confirmed
     /// via on-device diagnostic logging (2/2 real Control Center pauses) that
@@ -401,6 +580,38 @@ final class PlayerViewModel: ObservableObject {
     /// ≤0.5s) plus a track's final fade/silence before MusicKit reports the
     /// stop.
     private static let endOfTrackTolerance: TimeInterval = 3.0
+    /// How long after our own load a playing→paused edge is taken to be the
+    /// load's start-up blip rather than a pause (observed: up to ~370 ms).
+    private static let postLoadBlipWindow: TimeInterval = 1.0
+    /// How long after an in-app pause/play tap a stop edge is taken to be that
+    /// tap catching up rather than a new pause or a track end.
+    private static let recentToggleWindow: TimeInterval = 1.5
+    /// How long the player must sit stopped while we still believe we are
+    /// playing before the progress timer reconciles that mismatch. Comfortably
+    /// longer than the 200 ms end-of-track confirmation and than a track
+    /// hand-off, so it only ever fires on a genuinely stuck state, never on a
+    /// normal transition.
+    private static let stalledStateTolerance: TimeInterval = 1.5
+    /// Don't resume on its own after an interruption longer than this — after
+    /// ten minutes the user has very likely moved on, and sound coming back
+    /// unprompted would be a surprise rather than a convenience.
+    private static let maxAutoResumeAfterInterruption: TimeInterval = 600
+    /// How many upcoming tracks to keep mirrored into MusicKit's own queue.
+    ///
+    /// Was effectively 1, and a device capture showed exactly why that fails:
+    /// Control Center's next is handled INSIDE MusicKit (our
+    /// `nextTrackCommand` target never fires — confirmed by its diagnostic
+    /// staying silent through a whole skip run), so it can only move to an
+    /// entry we have already put there. Re-mirroring after each advance costs
+    /// a 200–400 ms catalog resolve, which is slower than a person tapping
+    /// skip — so the queue ran dry and MusicKit simply stopped, with
+    /// `nativeEntries=2` and its current entry the last one. Keeping a few
+    /// tracks of runway means a burst of skips still has somewhere to go
+    /// while the next resolve is in flight.
+    private static let nativeMirrorDepth = 3
+    /// Write-ahead stops past this many native entries (each write-ahead leaves
+    /// the displaced entries behind); the next load resets the native queue.
+    private static let maxNativeEntries = 40
     /// The Spotify URI Nodalong most recently told Spotify to play — lets
     /// `pollSpotifyPlaybackState()` detect when Spotify's actual current
     /// track diverges from what Nodalong expects (i.e. Spotify's own Next/
@@ -421,18 +632,6 @@ final class PlayerViewModel: ObservableObject {
     /// changes the next track just yields a cache miss and falls back to a live
     /// resolve. See `prefetchNext()` / `resolveUsingCache(_:)`.
     private var prefetchedNext: (uri: String, song: MusicKit.Song)?
-    /// The `QueueItem.id`s currently mirrored into MusicKit's own native
-    /// queue as the previous/next entries around whatever's playing — lets
-    /// repeat calls to `syncNativeQueueNeighbors()` no-op cheaply when
-    /// neither has changed. `nil` means nothing is mirrored on that side
-    /// (a queue boundary). See `syncNativeQueueNeighbors()`'s doc comment
-    /// for why this exists: Control Center's next/previous were confirmed
-    /// (via on-device diagnostic logging) to bypass our own registered
-    /// `MPRemoteCommandCenter` targets entirely and be handled internally by
-    /// MusicKit, which otherwise has nothing beyond the single current track
-    /// to move to.
-    private var mirroredPreviousItemId: UUID?
-    private var mirroredNextItemId: UUID?
 
     /// When the app entered background — used by
     /// `observeScenePhaseForStaleConnection()` to detect a long-idle period
@@ -470,7 +669,20 @@ final class PlayerViewModel: ObservableObject {
         NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.backgroundedAt = Date() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.backgroundedAt = Date()
+                // Interval follows the scene: slow down now that nothing is visible.
+                if self.progressTimer != nil { self.startProgressTimer() }
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.progressTimer != nil else { return }
+                self.startProgressTimer()   // back to 0.1 / 0.5 s; the next tick snaps `progress` to reality
+            }
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
@@ -506,10 +718,9 @@ final class PlayerViewModel: ObservableObject {
         // Tap-to-play resets the queue to just this track (explicit-queue model)
         // — leaving any active party's "queue is the party" model.
         isPartyDriven = false
-        queue = [QueueItem(song: song)]
-        currentIndex = 0
-        persistQueue()
-        await playCurrent()
+        let effect = send(.replace([song], startAt: 0))
+        logQueue("replace(single)")
+        await applyQueueEffect(effect)
     }
 
     /// Plays a track within an ordered list (album, playlist, artist Top Songs):
@@ -524,13 +735,56 @@ final class PlayerViewModel: ObservableObject {
         // Explicit list load resets the party-driven flag; the party bootstrap
         // re-establishes it by calling `reconcileQueue` immediately after.
         isPartyDriven = false
-        queue = songs.map { QueueItem(song: $0) }
-        currentIndex = index
-        persistQueue()
-        await playCurrent()
+        let effect = send(.replace(songs, startAt: index))
+        logQueue("replace(list) start=\(index)")
+        await applyQueueEffect(effect)
     }
 
     private struct PlaybackTimeoutError: Error {}
+
+    /// Runs `job` after every earlier native job (see `nativeChain`).
+    ///
+    /// Never call this from inside a job: the job would wait on a chain that is
+    /// waiting on it. Inside a job (`playCurrent`, `skipUnplayableAndAdvance`,
+    /// the background retry), call the work directly — it is already serialised.
+    private func enqueueNative(_ job: @escaping @MainActor () async -> Void) async {
+        let previous = nativeChain
+        nativeJobs += 1
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            await job()
+            self?.nativeJobs -= 1
+        }
+        nativeChain = task
+        await task.value
+    }
+
+    /// The ONLY way an external caller should start a track. Queues behind any
+    /// load or mirror already on the chain, and drops itself if by its turn the
+    /// user has moved to a different track — so holding ⏭ lands on the final
+    /// track instead of playing each one in turn. Two requests for the same
+    /// track collapse into one load.
+    private func requestPlayCurrent() async {
+        guard let target = queueState.currentID else { return }
+        guard pendingLoadTarget != target else { return }
+        pendingLoadTarget = target
+        await enqueueNative { [weak self] in
+            guard let self else { return }
+            if self.pendingLoadTarget == target { self.pendingLoadTarget = nil }
+            guard self.queueState.currentID == target else {
+                self.logQueue("load dropped — superseded before it started", "item=\(self.shortID(target))")
+                return
+            }
+            await self.playCurrent()
+        }
+    }
+
+    /// MusicKit and our model agree on what's loaded, and nothing is queued to
+    /// change that. MusicKit's own moves are only acted on in this state:
+    /// during a load — or between "⏭ moved the model" and "the load replaced the
+    /// native queue" — MusicKit's current entry is legitimately behind the model,
+    /// and reacting to it walked the index back and replayed a skipped song.
+    private var isSettled: Bool { nativeJobs == 0 && loadedItemID == queueState.currentID }
 
     /// Races `operation` against a plain timer — if `operation` hasn't
     /// completed within `seconds`, throws instead of hanging forever.
@@ -569,8 +823,10 @@ final class PlayerViewModel: ObservableObject {
             return
         }
         guard let song = currentItem?.song else { return }
+        let startingItemID = currentItem?.id
         isLoadingTrack = true
         defer { isLoadingTrack = false }
+        FieldLog.event("player", "load apple attempt=\(attempt) idx=\(currentIndex)/\(queue.count)", withMemory: true)
         stopPreviewPlayer()
         trackUnavailable = false
         spotifyPlaybackError = nil
@@ -595,11 +851,11 @@ final class PlayerViewModel: ObservableObject {
         // Same reasoning for the end-of-track detector's reference point —
         // a stale reading from the previous track must not leak forward.
         lastKnownElapsedWhilePlaying = 0
-        // `player.queue = [musicKitSong]` below wipes any previously mirrored
-        // native neighbors, so our bookkeeping of what's mirrored must reset
-        // too — `syncNativeQueueNeighbors()` will re-seed a fresh window.
-        mirroredPreviousItemId = nil
-        mirroredNextItemId = nil
+        // The native queue is replaced below, so any "stale mirror" verdict about
+        // the old one no longer applies, and nothing in it is known to be ours.
+        nativeQueueMirrorStale = false
+        nativeLayout = []
+        loadedItemID = nil
 
         let musicKitSong: MusicKit.Song
         do {
@@ -610,9 +866,20 @@ final class PlayerViewModel: ObservableObject {
             debugLog("[Nodalong.Player] resolve(\(song.title) by \(song.artist)) failed: \(error)")
             isPlaying = false
             lastPlaybackErrorDetail = "\(error)"
-            await skipUnplayableAndAdvance(failedTitle: song.title, attempt: attempt)
+            FieldLog.event("player", "⚠️ resolve failed \(FieldLog.tag(error)) attempt=\(attempt)")
+            await skipUnplayableAndAdvance(failedTitle: song.title, failedItemID: startingItemID, attempt: attempt)
             return
         }
+
+        // dismiss() / a skip / a queue replacement during the resolve: this load is
+        // stale. Starting audio now would play with no UI (or the wrong track).
+        guard currentItem?.id == startingItemID else {
+            logQueue("load abandoned", "wanted=\(shortID(startingItemID))")
+            FieldLog.event("player", "load abandoned — queue moved on during resolve")
+            return
+        }
+
+        healPlaceholderTitle(song: song, resolved: musicKitSong)
 
         do {
             // First try: full subscriber playback. MusicKit handles
@@ -623,11 +890,29 @@ final class PlayerViewModel: ObservableObject {
             let player = ApplicationMusicPlayer.shared
             player.queue = [musicKitSong]
             try await withTimeout(seconds: 8) { try await player.play() }
+            FieldLog.event("player", "play ok (full)")
+            playerLoaded = true
+            // The user moved on while play() was in flight (seen on device: a
+            // fast ⏭ left one track playing under the next one's title). Don't
+            // record this track as loaded or mirror around it — the newer load is
+            // already queued behind this one and replaces it in a moment.
+            guard let startingItemID, currentItem?.id == startingItemID else {
+                logQueue("load superseded during play()", "item=\(shortID(startingItemID))")
+                // Dismissed mid-load: nothing replaces it, so don't leave it playing.
+                if currentItem == nil { player.pause() }
+                return
+            }
+            logQueue("load ok", "item=\(shortID(startingItemID))")
             // Reset progress after play() resolves so that any stale
             // playbackTime from the previous track doesn't show briefly as
             // a wrong thumb position on the first timer tick.
             progress = 0
-            playerLoaded = true
+            loadedItemID = startingItemID
+            lastLoadCompletedAt = Date()
+            nativeLayout = [startingItemID]
+            // Baseline for the drift detector: this entry is the track we just
+            // loaded, not a move.
+            lastSeenNativeEntryID = player.queue.currentEntry?.id
             // A remote pause that arrived while THIS track was still loading
             // (see `pendingPauseIntent`'s doc comment) couldn't be safely
             // applied at the time — the player didn't have this track queued
@@ -642,22 +927,54 @@ final class PlayerViewModel: ObservableObject {
                 lastExplicitPauseAt = Date()
             }
             startProgressTimer()
+            // Mirror BEFORE prefetching. Both resolve the same upcoming
+            // track; running the mirror first lets it seed `prefetchedNext`,
+            // so `prefetchNext()`'s own `prefetchedNext?.uri != next.uri`
+            // guard turns it into a no-op. Reversed, they each paid for the
+            // same catalog lookup — two `[Nodalong.Resolve] resolved 'X'`
+            // lines per track in a device log.
+            // Already on the native chain — mirror directly (going through
+            // `syncNativeQueueNeighbors` would wait on this very job).
+            await performNativeQueueSync()
             prefetchNext()   // warm the next track's resolution while this plays
-            await syncNativeQueueNeighbors()
         } catch {
             // Fall back to preview playback. Most common cause:
             // ApplicationMusicPlayer throws because the user isn't
             // subscribed. Logged so the user can confirm the cause via the
             // Xcode console when debugging.
             debugLog("[Nodalong.Player] ApplicationMusicPlayer.play(\(musicKitSong.title)) failed: \(error)")
+            // Never fall back to the preview while backgrounded with no audio
+            // session yet. The preview needs `setActive(true)`, which iOS
+            // refuses from the background (`!int`, "cannot interrupt others") —
+            // a logged device run showed exactly that, followed by a ~50s CPU
+            // spike and a kill. Fail cleanly instead and let the next tap
+            // reload from scratch.
+            // One quiet retry first when this was just a timeout while
+            // backgrounded: the process was probably suspended mid-load, and a
+            // second attempt right after it resumes usually succeeds.
+            if error is PlaybackTimeoutError, attempt == 1, UIApplication.shared.applicationState != .active {
+                FieldLog.event("player", "background play timed out — retrying once")
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await playCurrent(attempt: 2)
+                return
+            }
+            if UIApplication.shared.applicationState != .active, !audioSessionActive {
+                FieldLog.event("player", "⚠️ ApplicationMusicPlayer.play failed in the BACKGROUND \(FieldLog.tag(error)) — not falling back to preview (audio session can't start)", withMemory: true)
+                isPlaying = false
+                playerLoaded = false
+                lastPlaybackErrorDetail = "\(error)"
+                return
+            }
+            FieldLog.event("player", "⚠️ ApplicationMusicPlayer.play failed \(FieldLog.tag(error)) → trying 30s preview", withMemory: true)
             do {
                 try await playPreview(of: musicKitSong)
             } catch {
                 // No preview assets either — skip this track and try the next.
                 debugLog("[Nodalong.Player] playPreview(\(musicKitSong.title)) failed: \(error)")
+                FieldLog.event("player", "⚠️ preview also failed \(FieldLog.tag(error))")
                 isPlaying = false
                 lastPlaybackErrorDetail = "\(error)"
-                await skipUnplayableAndAdvance(failedTitle: musicKitSong.title, attempt: attempt)
+                await skipUnplayableAndAdvance(failedTitle: musicKitSong.title, failedItemID: startingItemID, attempt: attempt)
             }
         }
     }
@@ -688,6 +1005,7 @@ final class PlayerViewModel: ObservableObject {
     /// its own in-process audio).
     private func playCurrentViaSpotify(attempt: Int = 1) async {
         guard let song = currentItem?.song, let spotifyService else { return }
+        let startingItemID = currentItem?.id
         isLoadingTrack = true
         defer { isLoadingTrack = false }
         stopPreviewPlayer()
@@ -735,7 +1053,7 @@ final class PlayerViewModel: ObservableObject {
             debugLog("[Nodalong.Player] Spotify play(\(song.title)) failed: \(error)")
             isPlaying = false
             lastPlaybackErrorDetail = (error as? SpotifyServiceError)?.errorDescription ?? "\(error)"
-            await skipUnplayableAndAdvance(failedTitle: song.title, attempt: attempt)
+            await skipUnplayableAndAdvance(failedTitle: song.title, failedItemID: startingItemID, attempt: attempt)
         }
     }
 
@@ -757,7 +1075,7 @@ final class PlayerViewModel: ObservableObject {
     func retryAfterSpotifyDeviceRecovery() async {
         guard awaitingSpotifyDeviceRetry, activeService == .spotify, currentItem != nil else { return }
         awaitingSpotifyDeviceRetry = false
-        await playCurrent()
+        await requestPlayCurrent()
     }
 
     /// Polls `GET /me/player` every ~3s while Spotify is active and playing —
@@ -786,7 +1104,7 @@ final class PlayerViewModel: ObservableObject {
            trackUri == spotifyQueuedNextUri,
            let matchedId = spotifyQueuedNextItemId,
            let matchedIndex = queue.firstIndex(where: { $0.id == matchedId }) {
-            currentIndex = matchedIndex
+            send(.nativeMoved(toItemID: matchedId))
             spotifyPlayingTrackUri = trackUri
             let song = queue[matchedIndex].song
             nowPlaying = NowPlayingTrack(
@@ -798,7 +1116,6 @@ final class PlayerViewModel: ObservableObject {
                 catalogId: song.catalogId,
                 isrc:      song.isrc
             )
-            persistQueue()
             syncSpotifyNativeQueue()   // pre-queue whatever's next now
         }
 
@@ -872,155 +1189,427 @@ final class PlayerViewModel: ObservableObject {
     /// when there's nothing else in its native queue). Cheap no-op when
     /// neither neighbor has changed since the last call. Safe to call
     /// unconditionally from every queue mutation.
+    ///
+    /// COALESCES rather than drops: at most one mirror waits on the native
+    /// chain, and it mirrors the LATEST queue when its turn comes. (Dropping
+    /// requests outright used to leave the native queue empty after the current
+    /// track under a run of Control Center skips — and with nothing there
+    /// MusicKit restarts the track or stops.)
+    ///
+    /// Never call from inside a native job — use `performNativeQueueSync()`.
     private func syncNativeQueueNeighbors() async {
-        guard activeService != .spotify, !isPreviewMode, playerLoaded else { return }
+        guard !mirrorQueued else { return }
+        mirrorQueued = true
+        await enqueueNative { [weak self] in
+            guard let self else { return }
+            self.mirrorQueued = false
+            await self.performNativeQueueSync()
+        }
+    }
+
+    /// Tops up the native queue with the next `nativeMirrorDepth` Up Next tracks.
+    /// Runs on the native chain only (`syncNativeQueueNeighbors`, or directly
+    /// from `playCurrent`).
+    private func performNativeQueueSync() async {
+        guard activeService != .spotify, !isPreviewMode, playerLoaded,
+              let anchor = queueState.currentID, loadedItemID == anchor else { return }
         let player = ApplicationMusicPlayer.shared
 
-        let nextItem = upNext.first
-        if nextItem?.id != mirroredNextItemId {
-            if let nextItem {
-                do {
-                    let musicKitSong = try await resolve(nextItem.song)
-                    try await player.queue.insert(musicKitSong, position: .afterCurrentEntry)
-                    mirroredNextItemId = nextItem.id
-                } catch {
-                    debugLog("[Nodalong.Player] syncNativeQueueNeighbors (next) failed: \(error)")
-                }
-            } else {
-                mirroredNextItemId = nil
+        // How many of OUR upcoming tracks are already sitting after the
+        // current entry in MusicKit's queue. Derived from the queue itself
+        // rather than from our own bookkeeping: bookkeeping can drift out of
+        // sync with reality, the queue cannot.
+        let entries = player.queue.entries
+        guard let liveID = player.queue.currentEntry?.id,
+              let liveIdx = entries.firstIndex(where: { $0.id == liveID }) else {
+            // No current entry to anchor against (queue empty or between
+            // tracks). `playCurrent()`'s own mirroring pass will re-seed.
+            return
+        }
+        let mirrored = Array(entries[(liveIdx + 1)...])
+        let want = Array(upNext.prefix(Self.nativeMirrorDepth))
+        let alreadyAhead = mirrored.count
+
+        // Content check, not just count — see `nativeQueueMirrorStale`'s
+        // doc comment for why this exists and what it can't fix directly.
+        // Stale = what MusicKit would play next isn't what we'd play next: the
+        // entries ahead of its current one aren't, in order, the start of Up
+        // Next. Checked against ALL of Up Next, not just the window we mirror —
+        // holding more correct entries than we mirror (which stepping back with
+        // Control Center previous always leaves) is not stale; it used to be
+        // counted as stale, and a fast double next then landed one track short.
+        // Entries beyond the end of Up Next are (something was cleared/removed).
+        // By position where we know the layout; by metadata otherwise.
+        let layoutAhead: [UUID]? = nativeLayout.flatMap { layout in
+            layout.count == entries.count ? Array(layout[(liveIdx + 1)...]) : nil
+        }
+        let up = upNext
+        let mismatch: Bool
+        if let layoutAhead {
+            mismatch = layoutAhead.count > up.count
+                || zip(layoutAhead, up).contains { $0 != $1.id }
+        } else {
+            mismatch = mirrored.count > up.count
+                || zip(mirrored, up).contains { !self.matches($0, $1.song) }
+        }
+        nativeQueueMirrorStale = mismatch
+
+        // WRITE AHEAD when the very next native entry isn't what we'd play next
+        // (after a reorder, a removal, or Play Next). Insert the right window
+        // straight after the playing entry — the playing entry is never
+        // transient, so MusicKit anchors on it correctly (Phase 0: landed after
+        // current, twice) — and the stale entries it displaces sit behind it.
+        // Only for the NEXT slot: rewriting whenever anything deeper differed
+        // would re-insert on every track change and grow the queue without bound
+        // (the displaced entries always differ). Deeper mismatches are caught when
+        // MusicKit moves (`nativeHopIsConsistent`). Needs a known layout, and
+        // stops past `maxNativeEntries`; every load resets the native queue.
+        if let layoutAhead, let first = want.first, layoutAhead.first != first.id {
+            guard entries.count + want.count <= Self.maxNativeEntries else {
+                logQueue("write-ahead skipped — native queue at cap", "entries=\(entries.count)")
+                return
             }
+            let resolved = await resolveForMirror(want, anchor: anchor)
+            guard resolved.count == want.count, queueState.currentID == anchor,
+                  upNext.prefix(want.count).map(\.id) == want.map(\.id) else {
+                diagLog("write-ahead: abandoned — queue moved or a resolve failed")
+                return
+            }
+            do {
+                try await insertIntoNativeQueue(resolved, position: .afterCurrentEntry)
+                let after = player.queue.entries
+                let landed = after.count == entries.count + resolved.count
+                    && Array(after[(liveIdx + 1)..<(liveIdx + 1 + resolved.count)]).map(\.title)
+                        == resolved.map(\.title)
+                if landed {
+                    nativeLayout?.insert(contentsOf: want.map(\.id), at: liveIdx + 1)
+                } else {
+                    nativeLayout = nil
+                    FieldLog.event("player", "write-ahead: entries didn't land after current — layout lost until next load")
+                }
+                logQueue("write-ahead", "inserted=\(want.map { shortID($0.id) }) landed=\(landed)")
+            } catch {
+                debugLog("[Nodalong.Player] write-ahead insert failed: \(error)")
+            }
+            return
         }
 
-        // PREVIOUS-neighbour mirroring REMOVED — it was the cause of the
-        // playback freeze.
-        //
-        // It could not use MusicKit's sanctioned insertion API the way the
-        // next-neighbour branch above does, because
-        // `MusicPlayer.Queue.EntryInsertionPosition` only offers
-        // `.afterCurrentEntry` and `.tail` — there is no "before current".
-        // The workaround was to reach into `player.queue.entries` and mutate
-        // that array directly, which corrupts the queue's internal state:
-        // subsequent player access then blocks forever in
-        // `-[MPMusicPlayerController playbackState]` →
-        // `_establishConnectionIfNeeded` → a synchronous XPC wait on
-        // `mediaplayerd` that never returns (confirmed by a main-thread
-        // backtrace captured during a real freeze). Because that call is
-        // synchronous and on the main thread, the whole app locks up with no
-        // recovery — the reported "no sound, nothing responds" symptom.
-        //
-        // Diagnostically confirmed: freezes occur only with a multi-item
-        // queue (album / Top Charts), never with a single-item queue (Feed
-        // taps, where nothing is mirrored); and disabling mirroring entirely
-        // eliminated them. Only this branch does raw `entries` mutation, so
-        // it is the half that goes.
-        //
-        // Cost: Control Center's PREVIOUS restarts the current track instead
-        // of stepping back. Control Center's NEXT still advances properly
-        // (the branch above uses the real API and is retained). This also
-        // matches Apple Music's own behaviour, where previous restarts the
-        // current track unless you're within the first few seconds.
-        mirroredPreviousItemId = nil
+        // TOP UP at the tail, only when what's ahead is (the start of) the
+        // window: appending after stale entries would line them up in front.
+        if let layoutAhead, layoutAhead != want.prefix(layoutAhead.count).map(\.id) { return }
+        guard alreadyAhead < want.count else { return }
+        let missing = Array(want[alreadyAhead...])
+        let resolved = await resolveForMirror(missing, anchor: anchor)
+        guard !resolved.isEmpty else { return }
+
+        // The resolves above can take a network round-trip each; bail if the
+        // queue moved on, or a load started (it replaces the native queue
+        // wholesale and re-mirrors itself).
+        guard queueState.currentID == anchor,
+              upNext.first?.id == want.first?.id else {
+            diagLog("mirror: abandoned \(resolved.count) track(s) — queue moved during resolve")
+            return
+        }
+
+        do {
+            try await insertIntoNativeQueue(resolved, position: .tail)
+            // Record which QueueItem each appended entry belongs to (read-only).
+            let after = player.queue.entries
+            if after.count == entries.count + resolved.count {
+                nativeLayout?.append(contentsOf: missing.prefix(resolved.count).map(\.id))
+            } else {
+                FieldLog.event("player", "mirror: entry count unexpected after insert (\(entries.count)+\(resolved.count) != \(after.count)) — layout lost until next load")
+                nativeLayout = nil
+            }
+            if prefetchedNext == nil, let first = missing.first, let song = resolved.first {
+                prefetchedNext = (first.song.uri, song)
+            }
+            diagLog("mirror: appended \(resolved.count) — \(missing.prefix(resolved.count).map(\.song.title).joined(separator: ", ")); native queue now \(player.queue.entries.count) entries")
+        } catch {
+            debugLog("[Nodalong.Player] syncNativeQueueNeighbors insert failed: \(error)")
+        }
     }
+
+    /// The one place the app inserts into MusicKit's queue — at `.tail` (top-up)
+    /// or `.afterCurrentEntry` (write-ahead). Never mutate `player.queue.entries`
+    /// directly: that is what froze the app (2026-08-07).
+    private func insertIntoNativeQueue(
+        _ songs: [MusicKit.Song],
+        position: ApplicationMusicPlayer.Queue.EntryInsertionPosition
+    ) async throws {
+        try await ApplicationMusicPlayer.shared.queue.insert(songs, position: position)
+    }
+
+    /// Resolves `items` in order for the mirror, reusing a warm `prefetchedNext`
+    /// (peeked, not consumed — the advance still needs it). Stops early if the
+    /// current track changes (a ⏭ queued behind is waiting) or a resolve fails,
+    /// and returns what it has.
+    private func resolveForMirror(_ items: [QueueItem], anchor: UUID) async -> [MusicKit.Song] {
+        var resolved: [MusicKit.Song] = []
+        for item in items {
+            guard queueState.currentID == anchor else { break }
+            do {
+                if let warm = prefetchedNext, warm.uri == item.song.uri {
+                    resolved.append(warm.song)
+                } else {
+                    resolved.append(try await resolve(item.song))
+                }
+            } catch {
+                debugLog("[Nodalong.Player] mirror resolve failed for '\(item.song.title)': \(error)")
+                break
+            }
+        }
+        return resolved
+    }
+
+    /// Which of our items MusicKit's current entry is, by its POSITION in the
+    /// native queue (see `nativeLayout`), double-checked against the entry's
+    /// metadata. `known == false`: the layout is lost or the check failed, so the
+    /// caller falls back to metadata. `id` may name an item that is no longer in
+    /// our queue — MusicKit started something we removed or cleared.
+    private func nativeCurrentItemID() -> (id: UUID?, known: Bool) {
+        let q = ApplicationMusicPlayer.shared.queue
+        let entries = q.entries
+        guard let layout = nativeLayout, layout.count == entries.count,
+              let cur = q.currentEntry?.id,
+              let k = entries.firstIndex(where: { $0.id == cur }) else { return (nil, false) }
+        let id = layout[k]
+        if let item = queueState.items.first(where: { $0.id == id }), !matches(q.currentEntry, item.song) {
+            return (nil, false)   // the order assumption broke — don't trust it
+        }
+        return (id, true)
+    }
+
+    /// MusicKit moved on its own — a natural end, Control Center next or
+    /// previous, or a jump of several tracks while the phone was locked. Only
+    /// called while `isSettled`.
+    private func handleNativeMove(_ entry: ApplicationMusicPlayer.Queue.Entry) {
+        let (id, known) = nativeCurrentItemID()
+        if known {
+            guard let id, let j = queue.firstIndex(where: { $0.id == id }) else {
+                // An entry we removed or cleared after mirroring it. It used to
+                // play on silently under the previous track's title; play what we
+                // actually want next, or stop.
+                logQueue("native → ghost")
+                FieldLog.event("player", "⚠️ native queue played an entry we removed — realigning (hasNext=\(hasNext))")
+                let effect = send(.nativeMoved(toItemID: nil))
+                Task { await applyQueueEffect(effect) }
+                return
+            }
+            if j == currentIndex { return }
+            // Forward through a mirror that predates a reorder: MusicKit is on
+            // the pre-reorder track. Load what the user actually put next.
+            if j > currentIndex, !nativeHopIsConsistent() {
+                logQueue("native → stale forward hop; loading upNext.first", "landedOn=\(shortID(id))")
+                FieldLog.event("player", "native advance → stale mirrored entry — forcing upNext.first")
+                let effect = send(.next)
+                Task { await applyQueueEffect(effect) }
+                return
+            }
+            // Forward OR backward — Control Center previous is followed too.
+            adoptNative(entry, itemID: id)
+            return
+        }
+        // Layout unknown: metadata fallback, forward-only, through the mirrored
+        // window. (It can't see a removal or a backward move, which is why the
+        // positional path above exists.)
+        guard let currentSong = currentItem?.song, !matches(entry, currentSong),
+              let hop = upNext.prefix(Self.nativeMirrorDepth).firstIndex(where: { matches(entry, $0.song) }) else {
+            logQueue("native → unidentified entry; leaving model alone")
+            return
+        }
+        if nativeQueueMirrorStale {
+            logQueue("native → stale forward hop (metadata); loading upNext.first")
+            let effect = send(.next)
+            Task { await applyQueueEffect(effect) }
+            return
+        }
+        adoptNative(entry, itemID: upNext[hop].id)
+    }
+
+    /// A forward native move is trustworthy when every native entry from the
+    /// track we were on up to where MusicKit landed is, in order, the start of
+    /// Up Next — i.e. MusicKit stepped through exactly what we'd have played.
+    /// (Replaces "the stale flag is off, or it landed on `upNext.first`", which
+    /// sent a correct two-track Control Center jump back one track.) Uses
+    /// `loadedItemID`, which is still the track we were on: `adoptNative`
+    /// updates it only after this check.
+    private func nativeHopIsConsistent() -> Bool {
+        let q = ApplicationMusicPlayer.shared.queue
+        let entries = q.entries
+        guard let layout = nativeLayout, layout.count == entries.count,
+              let cur = q.currentEntry?.id,
+              let k = entries.firstIndex(where: { $0.id == cur }),
+              let from = loadedItemID,
+              let p = layout[..<k].lastIndex(of: from) else { return false }
+        let stepped = Array(layout[(p + 1)...k])
+        return stepped == upNext.prefix(stepped.count).map(\.id)
+    }
+
+    /// Follows MusicKit onto `itemID` without reloading — it is already playing.
+    private func adoptNative(_ entry: ApplicationMusicPlayer.Queue.Entry, itemID: UUID) {
+        let before = currentIndex
+        guard case .adopt = send(.nativeMoved(toItemID: itemID)), let song = currentItem?.song else { return }
+        loadedItemID = itemID
+        nowPlaying = NowPlayingTrack(
+            title: song.title, artist: song.artist, album: song.album,
+            artwork: song.artwork, uri: song.uri, catalogId: song.catalogId, isrc: song.isrc)
+        currentDuration = entry.item.flatMap {
+            if case .song(let s) = $0 { return s.duration }
+            return nil
+        } ?? currentDuration
+        lastKnownElapsedWhilePlaying = 0
+        logQueue("native → adopted", "item=\(shortID(itemID))")
+        // Gapless-path telemetry: compare these against "advance via fallback".
+        FieldLog.event("player", "advance via mirror idx=\(before)→\(currentIndex)/\(queue.count)")
+        // MusicKit advanced on its own, so nothing re-mirrored the new next
+        // track or re-warmed the resolve cache. Mirror FIRST: it seeds
+        // `prefetchedNext`, so `prefetchNext()` then no-ops instead of paying
+        // for the same lookup twice.
+        Task {
+            await syncNativeQueueNeighbors()
+            prefetchNext()
+        }
+    }
+
+    // MARK: - Queue diagnostics
+
+    /// Short, stable tag for a `QueueItem` id in log lines.
+    private func shortID(_ id: UUID?) -> String {
+        id.map { String($0.uuidString.prefix(4)) } ?? "-"
+    }
+
+    /// One field-log line per queue mutation or native-queue event (Profile →
+    /// Share diagnostics), so queue trouble in the field can be read back. Ids
+    /// and indices only — the field log's privacy contract: no titles.
+    private func logQueue(_ op: String, _ extra: String = "") {
+        let up = upNext.prefix(4)
+        FieldLog.event("queue", "\(op) idx=\(currentIndex)/\(queue.count) cur=\(shortID(currentItem?.id)) up=[\(up.map { shortID($0.id) }.joined(separator: ","))] loading=\(isLoadingTrack) settled=\(isSettled) stale=\(nativeQueueMirrorStale) \(extra)")
+    }
+
 
     // MARK: - Queue operations
 
     /// Append a track to the end of the queue. If nothing is loaded yet, starts
     /// playing it immediately. Fires haptic feedback and shows a brief toast.
     func addToQueue(_ song: NodalongKit.Song) {
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        queue.append(QueueItem(song: song))
-        if nowPlaying == nil {
-            currentIndex = queue.count - 1
-            Task { await playCurrent() }
-        }
-        persistQueue()
-        syncSpotifyNativeQueue()
-        Task { await syncNativeQueueNeighbors() }
-        // Pre-resolve the next track while the current one plays so a later skip
-        // (especially a backgrounded lock-screen skip) starts audio instantly and
-        // doesn't stall on a network resolve.
-        prefetchNext()
+        guard canEditQueue() else { return }
+        Haptics.impact(.medium)
+        // The queue already ran out and went quiet: the added track should start,
+        // not sit behind a "play" that would replay the last one.
+        let wasFinished = isFinishedAtEnd
+        let effect = send(.append(song, startIfIdle: nowPlaying == nil || wasFinished))
+        Task { await applyQueueEffect(effect) }
+        logQueue("append", "startedPlayback=\(effect != .none)")
         flashQueueToast(song.title)
     }
+
+    /// Insert a track directly after the one that's playing. Only our own
+    /// `queue` is touched — never `player.queue.entries` (see the 2026-08-07
+    /// freeze entry); the native-queue mirror is re-synced afterwards, and if it
+    /// lags, drift detection already recovers through a single-entry load.
+    /// With nothing loaded this is just `addToQueue`.
+    func playNext(_ song: NodalongKit.Song) {
+        guard nowPlaying != nil, !queue.isEmpty else { addToQueue(song); return }
+        guard canEditQueue() else { return }
+        Haptics.impact(.medium)
+        let wasFinished = isFinishedAtEnd
+        let effect = send(.insertNext(song, startIfIdle: wasFinished))
+        Task { await applyQueueEffect(effect) }
+        logQueue("insertNext")
+        flashQueueToast("Playing next: \(song.title)")
+    }
+
+    /// True when the last queue entry finished and playback went quiet.
+    private var isFinishedAtEnd: Bool {
+        nowPlaying != nil && !hasNext && !isPlaying && progress >= 0.999 && !isLoadingTrack
+    }
+
+    /// A tuned-in listener has no queue of its own, and an LP-driven queue is
+    /// rebuilt from the party's on every change — editing either locally would
+    /// either desync playback or be silently thrown away while the toast said it
+    /// worked. Refuse with an honest message instead.
+    private func canEditQueue() -> Bool {
+        if followContext != nil {
+            flashQueueToast("Can't queue while tuned in", kind: .skipped)
+            return false
+        }
+        if isPartyDriven {
+            flashQueueToast("Add songs through the LP", kind: .skipped)
+            return false
+        }
+        return true
+    }
+
+    private var queueToastToken = UUID()
 
     private func flashQueueToast(_ title: String, kind: QueueToastKind = .added) {
         queueToast = title
         queueToastKind = kind
+        // Token so an earlier toast's timer can't dismiss a later one early.
+        let token = UUID()
+        queueToastToken = token
         Task {
             try? await Task.sleep(nanoseconds: 1_800_000_000)
-            queueToast = nil
+            if queueToastToken == token { queueToast = nil }
         }
     }
 
     /// Advance to the next queued track, or stop (keeping the now-playing
     /// surface) when the queue is exhausted.
     func skipToNext() async {
-        guard hasNext else {
-            isPlaying = false
-            stopBackends()
-            return
-        }
-        currentIndex += 1
-        lastPlaybackStatus = .playing  // re-arm before playCurrent arms it again
-        persistQueue()
-        await playCurrent()
+        let effect = send(.next)
+        logQueue(effect == .stop ? "next → end of queue" : "next")
+        await applyQueueEffect(effect)
     }
 
     /// Restart the current track if more than 3 s in (or there's nothing before
     /// it), otherwise step back one entry — matches Apple Music.
     func skipToPrevious() async {
-        if progress * currentDuration > 3 || !hasPrevious {
-            seek(to: 0)
-            return
-        }
-        currentIndex -= 1
-        lastPlaybackStatus = .playing
-        persistQueue()
-        await playCurrent()
+        let effect = send(.previous(restartInstead: progress * currentDuration > 3))
+        logQueue(effect == .restart ? "previous → restart" : "previous")
+        await applyQueueEffect(effect)
     }
 
     /// Jump straight to a queue entry (tapping a row in Up Next).
     func playQueueItem(_ item: QueueItem) async {
-        guard let idx = queue.firstIndex(of: item) else { return }
-        currentIndex = idx
-        lastPlaybackStatus = .playing
-        persistQueue()
-        await playCurrent()
+        let effect = send(.jump(item.id))
+        logQueue(effect == .none ? "jump IGNORED" : "jump", "item=\(shortID(item.id))")
+        await applyQueueEffect(effect)
     }
 
-    /// Reorder within the Up Next region. Offsets are relative to `upNext`.
-    /// Reimplements `move(fromOffsets:toOffset:)` with plain `Array` ops so the
-    /// VM needn't import SwiftUI.
-    func moveUpNext(fromOffsets source: IndexSet, toOffset destination: Int) {
-        let base = currentIndex + 1
-        guard base <= queue.count else { return }
-        var up = Array(queue[base...])
-        let moving = source.sorted().map { up[$0] }
-        for i in source.sorted(by: >) { up.remove(at: i) }
-        let insertAt = destination - source.filter { $0 < destination }.count
-        up.insert(contentsOf: moving, at: min(max(insertAt, 0), up.count))
-        queue.replaceSubrange(base..., with: up)
-        persistQueue()
-        syncSpotifyNativeQueue()
-        Task { await syncNativeQueueNeighbors() }
+    /// Reorder Up Next by id: `ids` end up just before `before` (nil = the end).
+    /// By id rather than offset so a drop that lands after the queue moved on
+    /// (a track ended mid-drag) can only move the rows the user dragged.
+    func moveUpNext(ids: [UUID], before: UUID?) {
+        send(.move(ids: ids, before: before))
+        logQueue("move", "moved=\(ids.map { shortID($0) }) before=\(shortID(before))")
     }
 
-    /// Remove entries from the Up Next region. Offsets are relative to `upNext`.
-    func removeUpNext(atOffsets offsets: IndexSet) {
-        let base = currentIndex + 1
-        for offset in offsets.sorted(by: >) {
-            let absolute = base + offset
-            if queue.indices.contains(absolute) { queue.remove(at: absolute) }
+    /// Empties the Up Next region. The current track is untouched and keeps
+    /// playing — only what comes after it is removed.
+    func clearUpNext() {
+        send(.clearUpNext)
+        logQueue("clearUpNext")
+    }
+
+    /// Remove Up Next entries by id. The current track is never removed.
+    func removeUpNext(ids: Set<UUID>) {
+        send(.remove(ids: ids))
+        logQueue("remove", "removed=\(ids.map { shortID($0) })")
+    }
+
+    /// Fired when a track finishes — advances, or stops at the end of the queue.
+    /// `itemID` is the track that ended (nil = whatever is current, for callers
+    /// that don't know). A second call for the same track, or one that arrives
+    /// after a skip already moved on, is a no-op in the reducer — which is what
+    /// stops a double advance.
+    private func handleTrackEnd(itemID: UUID? = nil) async {
+        guard let ended = itemID ?? queueState.currentID, ended == queueState.currentID else {
+            logQueue("trackEnded IGNORED (not current)", "item=\(shortID(itemID))")
+            return
         }
-        persistQueue()
-        syncSpotifyNativeQueue()
-        Task { await syncNativeQueueNeighbors() }
-    }
-
-    /// Fired when the current track finishes — advances, or stops at the end of
-    /// the queue. Guarded against the progress timer re-firing it.
-    private func handleTrackEnd() async {
-        guard !isAdvancing else { return }
+        logQueue("trackEnded", "item=\(shortID(ended))")
         // A sync-follower has no queue of its own. In single-song tune-in the
         // session ends when the song does; a station just idles here until the
         // broadcaster's next-track update arrives (which loads it fresh).
@@ -1034,13 +1623,23 @@ final class PlayerViewModel: ObservableObject {
             }
             return
         }
-        isAdvancing = true
-        defer { isAdvancing = false }
+        // MusicKit plays out-of-process, so between tracks this process isn't
+        // producing audio and iOS may suspend it mid-load — which is how a
+        // backgrounded advance ended in an 8 s PlaybackTimeoutError. Hold a
+        // background task for the duration of the advance.
+        var bgTask = UIBackgroundTaskIdentifier.invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "nodalong.advance") {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
+        defer {
+            if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+        }
         if hasNext {
-            currentIndex += 1
-            persistQueue()
-            await playCurrent()
+            FieldLog.event("player", "advance via fallback (track end) idx=\(currentIndex)→\(currentIndex + 1)/\(queue.count)")
+            await applyQueueEffect(send(.trackEnded(itemID: ended)))
         } else {
+            FieldLog.event("player", "track end → queue finished, stopping (idx=\(currentIndex)/\(queue.count))")
             isPlaying = false
             progress  = 1.0
             stopBackends()
@@ -1085,17 +1684,30 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
+    /// Invalidates any in-flight load and the state that only meant something to
+    /// it. Without this a track still resolving when the player is dismissed (or
+    /// a follow ends) comes back to life afterwards with no UI.
+    /// Callers clear the queue right after (`send(.clearAll)`), which is what
+    /// stops a queued load: it finds no current track and drops itself, and one
+    /// mid-resolve abandons on its own current-item check.
+    private func cancelPendingLoads() {
+        prefetchedNext = nil
+        nativeQueueMirrorStale = false
+        nativeLayout = []
+        loadedItemID = nil
+    }
+
     /// Leaves follow mode and stops playback (returns the player to idle — it does
     /// not resume whatever was playing solo before).
     func stopFollowing() {
         guard followContext != nil else { return }
+        cancelPendingLoads()
         followContext = nil
         stopBackends()          // pauses the active backend + kills the timers
         isPlaying    = false
         progress     = 0
         nowPlaying   = nil
-        queue        = []
-        currentIndex = 0
+        send(.clearAll)
         playerLoaded = false
         isPreviewMode = false
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -1107,9 +1719,7 @@ final class PlayerViewModel: ObservableObject {
     /// from auto-advancing.
     private func loadFollowTrack(_ song: NodalongKit.Song, seekMs: Int, isPlaying: Bool) async {
         isPartyDriven = false
-        queue = [QueueItem(song: song)]
-        currentIndex = 0
-        await playCurrent()
+        await applyQueueEffect(send(.replace([song], startAt: 0)))
         guard followContext != nil else { return }   // user left mid-load
         seekToMs(seekMs)
         if !isPlaying { pauseFollow() }
@@ -1146,57 +1756,48 @@ final class PlayerViewModel: ObservableObject {
     /// correct occurrence. Only ever called with party songs (host-side).
     func reconcileQueue(with songs: [NodalongKit.Song]) {
         guard let current = currentItem else { return }          // nothing loaded → no-op
-        guard !isAdvancing else { pendingReconcile = songs; return } // defer during a skip/retry chain
-        guard let anchor = songs.firstIndex(where: { $0.id == current.song.id }) else {
+        // No deferral needed during a skip/retry chain: `send` is synchronous, and
+        // the chain's own `.skipUnplayable(itemID:)` only advances if its track is
+        // still current, so a party update can't knock it off course.
+        guard songs.contains(where: { $0.id == current.song.id }) else {
             // Currently-playing track isn't in the party queue anymore — leave
             // local playback alone; a later snapshot may restore alignment.
             return
         }
         isPartyDriven = true   // reconcile owns the queue now (set even on a no-op pass)
-        let newUpNext = Array(songs[(anchor + 1)...])
-        // Short-circuit when the upcoming order is unchanged — avoids @Published
-        // churn on every played-flag flip / track boundary.
-        if newUpNext.map(\.id) == upNext.map(\.song.id) { return }
-        queue = [current] + newUpNext.map { QueueItem(song: $0) }
-        currentIndex = 0
-        persistQueue()
-        syncSpotifyNativeQueue()
-        Task { await syncNativeQueueNeighbors() }
-        prefetchNext()
-    }
-
-    /// Applies a party reconcile that arrived while a skip/retry chain was in
-    /// flight (stashed by `reconcileQueue`).
-    private func drainPendingReconcile() {
-        guard let songs = pendingReconcile else { return }
-        pendingReconcile = nil
-        reconcileQueue(with: songs)
+        // Rebuilds Up Next after the current track, reusing existing items so a
+        // row the user is looking at keeps its identity. History is KEPT: it used
+        // to be dropped, which left MusicKit's earlier native entries pointing at
+        // items we no longer had, so Control Center's previous went forward.
+        // An unchanged order is a no-op (no publish on every played-flag flip).
+        let epoch = queueState.epoch
+        send(.reconcile(songs))
+        if queueState.epoch != epoch { logQueue("reconcile") }
     }
 
     /// Called when `playCurrent()` can't resolve or play the current item.
     /// Advances past the broken track and retries rather than halting the whole
     /// session on one bad song. Bounded by `attempt < queue.count` so a fully
     /// unplayable queue terminates (falling back to `trackUnavailable`) instead
-    /// of looping. Reuses `isAdvancing` — the same guard `handleTrackEnd()` uses
-    /// — so a timer-driven end-of-track edge can't race a skip.
-    private func skipUnplayableAndAdvance(failedTitle: String, attempt: Int) async {
-        guard !isAdvancing else { return }
-        isAdvancing = true
+    /// of looping. Runs inside the load's native-chain job, so nothing else can
+    /// touch the player meanwhile.
+    private func skipUnplayableAndAdvance(failedTitle: String, failedItemID: UUID?, attempt: Int) async {
+        // If the user already moved on (tapped Next, jumped, replaced the queue)
+        // while this load was failing, `currentIndex` no longer points at the
+        // failed track — advancing from it would skip THEIR choice.
+        if let failedItemID, currentItem?.id != failedItemID { return }
         flashQueueToast(failedTitle, kind: .skipped)
+        FieldLog.event("player", "skip unplayable attempt=\(attempt) idx=\(currentIndex)/\(queue.count) hasNext=\(hasNext)")
         guard attempt < queue.count, hasNext else {
+            FieldLog.event("player", "⚠️ nothing playable left — stopping with trackUnavailable")
             // Tried every entry (or nothing left) — give up, matching today's
             // terminal behavior.
             isPlaying = false
             trackUnavailable = true
             stopBackends()
-            isAdvancing = false
-            drainPendingReconcile()
             return
         }
-        currentIndex += 1
-        persistQueue()
-        isAdvancing = false        // release before recursing so a further failure can re-enter
-        drainPendingReconcile()    // apply any party update that arrived mid-chain
+        if let failedItemID { send(.skipUnplayable(itemID: failedItemID)) } else { send(.next) }
         await playCurrent(attempt: attempt + 1)
     }
 
@@ -1260,11 +1861,13 @@ final class PlayerViewModel: ObservableObject {
     /// Pause/resume the current track. Routes to the right player based on
     /// which path is active.
     func togglePlayPause() async {
+        FieldLog.event("player", "toggle (isPlaying=\(isPlaying) loaded=\(playerLoaded) preview=\(isPreviewMode))")
+        lastToggleAt = Date()
         // First play after a cold-launch restore: nothing is loaded into the
         // player yet, so resolve + enqueue the persisted track via playCurrent()
         // rather than calling play() on an empty player queue (which no-ops).
         if !isPlaying, !playerLoaded, currentItem != nil {
-            await playCurrent()
+            await requestPlayCurrent()
             return
         }
 
@@ -1315,6 +1918,38 @@ final class PlayerViewModel: ObservableObject {
                     lastExplicitPauseAt = Date()
                 }
             } else {
+                // A bare `player.play()` resumes MusicKit's OWN queue from
+                // wherever MusicKit is — which is not necessarily where we
+                // are. That queue is not a mirror of ours: it starts as a
+                // single entry, but `syncNativeQueueNeighbors()` inserts the
+                // upcoming track after the current one and never removes
+                // anything, so across a run of native auto-advances it
+                // accumulates the whole stretch played this session. Resume
+                // it once it has run out and it restarts from ITS first
+                // entry — the track the session began on. That is the
+                // reported "keep pressing skip until it stops, then it goes
+                // back to the start of the queue".
+                //
+                // Checking `playbackStatus == .stopped` alone was not enough:
+                // an exhausted queue can report `.paused`. The reliable
+                // question is not what the status says but whether MusicKit
+                // is still sitting on the exact track we think is current.
+                // If it is not — different entry, or no entry at all — its
+                // queue has moved on or emptied, and resuming it would play
+                // something we did not ask for. Reload ours instead.
+                let onOurTrack = currentItem.map { item in
+                    // By position first — metadata matching false-negatives for
+                    // tracks whose stored artist/title differ from MusicKit's, which
+                    // restarted the song from 0:00 on every resume.
+                    let native = nativeCurrentItemID()
+                    if native.known { return native.id == item.id }
+                    return matches(player.queue.currentEntry, item.song)
+                } ?? false
+                if !onOurTrack || player.state.playbackStatus == .stopped || progress >= 0.999 {
+                    diagLog("resume: reloading our track (onOurTrack=\(onOurTrack) status=\(player.state.playbackStatus) progress=\(String(format: "%.3f", progress)))")
+                    await requestPlayCurrent()
+                    return
+                }
                 do {
                     try await withTimeout(seconds: 8) { try await player.play() }
                     isPlaying = true
@@ -1328,7 +1963,7 @@ final class PlayerViewModel: ObservableObject {
                     // from scratch via `playCurrent()` gives it a real
                     // second chance instead of silently staying paused.
                     debugLog("[Nodalong.Player] togglePlayPause resume failed: \(error)")
-                    await playCurrent()
+                    await requestPlayCurrent()
                 }
             }
         }
@@ -1337,15 +1972,16 @@ final class PlayerViewModel: ObservableObject {
 
     /// Stop playback entirely and clear the now-playing surface.
     func dismiss() {
+        cancelPendingLoads()
         nowPlaying = nil
         isPlaying  = false
         isExpanded = false
         progress   = 0
-        queue        = []
-        currentIndex = 0
+        send(.clearAll)
         playerLoaded = false
         isPartyDriven = false
         UserDefaults.standard.removeObject(forKey: queueKey)
+        UserDefaults.standard.removeObject(forKey: queueIndexKey)
         stopPreviewPlayer()
         progressTimer?.invalidate()
         progressTimer = nil
@@ -1366,6 +2002,29 @@ final class PlayerViewModel: ObservableObject {
     /// Resolves `song`, using the warm `prefetchedNext` cache when it matches so
     /// an auto-advance skips the network round-trip. Falls back to a live
     /// `resolve` on a cache miss.
+    /// A track saved while its album was unreleased can carry Apple's "Track 6"
+    /// placeholder in the shared catalog. Playback resolves the real song, so
+    /// this is the moment we learn the true title: show it now and write it back
+    /// to the catalog row so every screen (and every user) picks it up.
+    private func healPlaceholderTitle(song: NodalongKit.Song, resolved: MusicKit.Song) {
+        guard isPlaceholderTrackTitle(song.title),
+              !resolved.title.isEmpty, !isPlaceholderTrackTitle(resolved.title),
+              nowPlaying?.uri == song.uri else { return }
+        if let np = nowPlaying {
+            nowPlaying = NowPlayingTrack(
+                title: resolved.title, artist: np.artist, album: np.album,
+                artwork: np.artwork, uri: np.uri, catalogId: np.catalogId, isrc: np.isrc
+            )
+        }
+        let isrc = song.isrc ?? resolved.isrc
+        let input = CatalogTrackInput(
+            title: resolved.title, artist: song.artist, album: song.album,
+            artwork: song.artwork, isrc: isrc,
+            appleMusicUri: song.uri, appleMusicTrackId: song.uri
+        )
+        Task.detached(priority: .utility) { _ = try? await upsertCatalogTrack(input) }
+    }
+
     private func resolveUsingCache(_ song: NodalongKit.Song) async throws -> MusicKit.Song {
         if let cached = prefetchedNext, cached.uri == song.uri {
             prefetchedNext = nil
@@ -1384,6 +2043,8 @@ final class PlayerViewModel: ObservableObject {
             return
         }
         guard prefetchedNext?.uri != next.uri else { return }
+        // ⏭ in the full player should land on artwork that's already decoded.
+        warmHeroArtwork(next.artwork)
         Task { [weak self] in
             guard let self else { return }
             guard let resolved = try? await self.resolve(next) else { return }
@@ -1481,8 +2142,10 @@ final class PlayerViewModel: ObservableObject {
         guard let data  = UserDefaults.standard.data(forKey: queueKey),
               let items = try? JSONDecoder().decode([QueueItem].self, from: data),
               !items.isEmpty else { return }
-        queue        = items
-        currentIndex = UserDefaults.standard.integer(forKey: queueIndexKey)
+        // Clamped inside `QueueState`: a missing or stale index must not leave a
+        // queue with no current item.
+        queueState = QueueState(items: items, currentIndex: UserDefaults.standard.integer(forKey: queueIndexKey))
+        syncPublishedQueue()
         updateRemoteCommandState()
         // Restored into our model only — nothing is loaded into the player yet,
         // so the first play must route through `playCurrent()`.
@@ -1518,7 +2181,20 @@ final class PlayerViewModel: ObservableObject {
     /// which shows no progress UI. Even at 2 Hz the end-of-track edge detector
     /// still catches a finished track within half a second, so background
     /// auto-advance keeps working.
-    private var progressInterval: TimeInterval { isExpanded ? 0.1 : 0.5 }
+    ///
+    /// **Backgrounded: 1 Hz, and `progress` is not written at all** (see
+    /// `appIsActive`). Nothing on screen can show it, but every write re-renders
+    /// whatever observes the clock — with the full-screen player open that was
+    /// ten SwiftUI updates a second for nobody, in a field log of repeated
+    /// background CPU spikes. The end-of-track detector and drift detection
+    /// still run every tick; only the UI writes stop.
+    private var progressInterval: TimeInterval {
+        guard appIsActive else { return 1.0 }
+        return isExpanded ? 0.1 : 0.5
+    }
+
+    /// `true` only while the app is in the foreground and interactive.
+    private var appIsActive: Bool { UIApplication.shared.applicationState == .active }
 
     private func startProgressTimer() {
         progressTimer?.invalidate()
@@ -1529,7 +2205,7 @@ final class PlayerViewModel: ObservableObject {
                     guard self.isPlaying else { return }
                     // Advance the bar by the poll interval; the true end is
                     // delivered by AVPlayerItemDidPlayToEndTime → handleTrackEnd().
-                    self.progress = min(1.0, self.progress + self.progressInterval / self.currentDuration)
+                    if self.appIsActive { self.progress = min(1.0, self.progress + self.progressInterval / self.currentDuration) }
                 } else if self.activeService == .spotify {
                     guard self.isPlaying else { return }
                     // Spotify's Web API has no push mechanism — the ~3s poll
@@ -1541,7 +2217,7 @@ final class PlayerViewModel: ObservableObject {
                     // `currentDuration` from the server and to detect
                     // end-of-track / an externally-triggered pause.
                     if self.currentDuration > 0 {
-                        self.progress = min(1.0, self.progress + self.progressInterval / self.currentDuration)
+                        if self.appIsActive { self.progress = min(1.0, self.progress + self.progressInterval / self.currentDuration) }
                     }
                 } else {
                     // ApplicationMusicPlayer: read the actual position.
@@ -1564,15 +2240,22 @@ final class PlayerViewModel: ObservableObject {
 
                     if status == .playing {
                         let elapsed = player.playbackTime
-                        self.progress = self.currentDuration > 0
-                            ? min(1.0, elapsed / self.currentDuration)
-                            : 0
+                        if self.appIsActive {
+                            self.progress = self.currentDuration > 0
+                                ? min(1.0, elapsed / self.currentDuration)
+                                : 0
+                        }
                         // Keep the last elapsed reading from a tick where the
                         // player was CONFIRMED still playing — used below to
                         // tell a genuine end-of-track apart from an early
                         // pause. See its doc comment.
                         self.lastKnownElapsedWhilePlaying = elapsed
-                        if !self.isPlaying {
+                        // Not right after our own pause: MusicKit's status lags
+                        // `player.pause()` by a tick, and reading that as
+                        // "something resumed it" flipped ⏸ back on for a few
+                        // hundred ms (device log 18:44:43).
+                        let justPaused = self.lastExplicitPauseAt.map { Date().timeIntervalSince($0) < 1.0 } ?? false
+                        if !self.isPlaying, !justPaused {
                             // Something resumed playback without going through
                             // our own code — reconcile rather than silently
                             // staying stuck "paused" while audio actually plays.
@@ -1580,37 +2263,18 @@ final class PlayerViewModel: ObservableObject {
                         }
                     }
 
-                    // MusicKit's own native next/previous (bypassing our
-                    // registered `MPRemoteCommandCenter` targets entirely —
-                    // confirmed via diagnostic logging) can move
-                    // `currentEntry` to a mirrored neighbor with NO
-                    // playbackStatus edge we'd otherwise notice (no stop,
-                    // just a different track continuing to play). Compare
-                    // against what we expect; a mismatch that matches one of
-                    // our own mirrored previous/next entries means Control
-                    // Center's next/previous actually had somewhere real to
-                    // go — see `syncNativeQueueNeighbors()`.
-                    if let currentEntry = player.queue.currentEntry,
-                       let currentSong = self.currentItem?.song,
-                       !self.matches(currentEntry, currentSong) {
-                        if let next = self.upNext.first, self.matches(currentEntry, next.song) {
-                            self.currentIndex += 1
-                        } else if self.hasPrevious, self.matches(currentEntry, self.queue[self.currentIndex - 1].song) {
-                            self.currentIndex -= 1
-                        }
-                        if let song = self.currentItem?.song {
-                            self.nowPlaying = NowPlayingTrack(
-                                title: song.title, artist: song.artist, album: song.album,
-                                artwork: song.artwork, uri: song.uri, catalogId: song.catalogId,
-                                isrc: song.isrc
-                            )
-                            self.currentDuration = currentEntry.item.flatMap {
-                                if case .song(let s) = $0 { return s.duration }
-                                return nil
-                            } ?? self.currentDuration
-                            self.persistQueue()
-                            Task { await self.syncNativeQueueNeighbors() }
-                        }
+                    // MusicKit's own next/previous (Control Center, which never
+                    // reaches our `MPRemoteCommandCenter` targets) and its own
+                    // gapless advance move `currentEntry` with no status edge we
+                    // would otherwise notice. Only evaluated on a genuine entry
+                    // CHANGE, and only while settled: during a load — or between
+                    // ⏭ moving the model and the load replacing the native
+                    // queue — the native entry is legitimately behind us, and
+                    // reacting to it walked the index back.
+                    let entry = player.queue.currentEntry
+                    if self.isSettled, entry?.id != self.lastSeenNativeEntryID {
+                        self.lastSeenNativeEntryID = entry?.id
+                        if let entry { self.handleNativeMove(entry) }
                     }
 
                     // MusicKit has no end-of-track callback for ApplicationMusicPlayer.
@@ -1620,9 +2284,94 @@ final class PlayerViewModel: ObservableObject {
                     // progress = 0 at the exact moment we need to act.
                     let justStopped = self.lastPlaybackStatus == .playing
                                       && (status == .paused || status == .stopped)
+                    if status != self.lastPlaybackStatus {
+                        // Every native status transition, with how much of the
+                        // track was left — the evidence that separates "ended
+                        // naturally" from "something stopped it mid-track".
+                        // Anything that isn't a plain start also carries the
+                        // audio snapshot: Apple Music plays out-of-process, so
+                        // this app never receives the audio-session
+                        // interruption that would otherwise name the cause.
+                        let audio = status == .playing ? "" : " " + FieldLog.audioSnapshot()
+                        FieldLog.event("player", "native status \(self.lastPlaybackStatus)→\(status) elapsed=\(Int(self.lastKnownElapsedWhilePlaying))s of \(Int(self.currentDuration))s believedPlaying=\(self.isPlaying) loading=\(self.isLoadingTrack) settled=\(self.isSettled)\(audio)")
+                    }
+
+                    // Resume after an interruption. Two logged device runs show
+                    // MusicKit going `playing → interrupted` (a call, Siri,
+                    // another app) and, when it ended, settling on `.paused`
+                    // and staying there — the user had to notice and press
+                    // play. Apple Music resumes by itself after a call; this
+                    // does the same, but only when it is clearly safe:
+                    //  - we believed we were playing (so the user hadn't paused),
+                    //  - no pause of ours landed during the interruption,
+                    //  - it was short, and nothing else is loading or advancing.
+                    if status == .interrupted {
+                        if self.interruptedSince == nil { self.interruptedSince = Date() }
+                    } else if self.lastPlaybackStatus == .interrupted, status == .paused,
+                              let since = self.interruptedSince {
+                        self.interruptedSince = nil
+                        let length = Date().timeIntervalSince(since)
+                        let userPaused = self.lastExplicitPauseAt.map { $0 > since } ?? false
+                        if self.isPlaying, !userPaused, self.isSettled,
+                           length < Self.maxAutoResumeAfterInterruption {
+                            FieldLog.event("player", "interruption ended after \(Int(length))s → resuming \(FieldLog.audioSnapshot())")
+                            Task { @MainActor [weak self] in
+                                do {
+                                    try await self?.withTimeout(seconds: 8) { try await ApplicationMusicPlayer.shared.play() }
+                                    FieldLog.event("player", "resume after interruption ok")
+                                } catch {
+                                    FieldLog.event("player", "⚠️ resume after interruption failed \(FieldLog.tag(error))")
+                                }
+                            }
+                        } else {
+                            FieldLog.event("player", "interruption ended after \(Int(length))s → NOT resuming (believedPlaying=\(self.isPlaying) userPaused=\(userPaused) loading=\(self.isLoadingTrack))")
+                        }
+                    } else if status == .playing {
+                        self.interruptedSince = nil
+                    }
                     self.lastPlaybackStatus = status
+
+                    // The edge above is a ONE-SHOT: `lastPlaybackStatus` is
+                    // committed here, so if the confirmation task below bails
+                    // (a load was in flight or queued, a stale `lastExplicitPauseAt` was still
+                    // inside its grace window) the edge is consumed and never
+                    // re-fires — the track has genuinely ended, audio is
+                    // stopped, but `isPlaying` stays `true` and nothing ever
+                    // advances. That is the reported "sometimes when a song is
+                    // over it stops playing", and it also makes the first tap
+                    // on ▶ take `togglePlayPause`'s PAUSE branch (because we
+                    // still believe we're playing), so it appears to do
+                    // nothing. Watch for the state instead of relying on the
+                    // edge, and reconcile once it has clearly persisted.
+                    if self.isPlaying, status == .paused || status == .stopped,
+                       self.isSettled {
+                        let since = self.believedPlayingButStoppedSince ?? Date()
+                        self.believedPlayingButStoppedSince = since
+                        if Date().timeIntervalSince(since) >= Self.stalledStateTolerance {
+                            self.believedPlayingButStoppedSince = nil
+                            let remaining = self.currentDuration - self.lastKnownElapsedWhilePlaying
+                            if remaining <= Self.endOfTrackTolerance {
+                                // Reached its end and the advance was lost —
+                                // run it now.
+                                FieldLog.event("player", "⚠️ stalled at end — advance had been lost, running it now")
+                                await self.handleTrackEnd()
+                            } else {
+                                FieldLog.event("player", "⚠️ stalled MID-TRACK remaining=\(Int(remaining))s — stopped by something outside the app; publishing paused")
+                                // Stopped mid-track by something outside our
+                                // code. Publish the truth so ▶ resumes on the
+                                // first tap instead of "pausing" what is
+                                // already paused.
+                                self.isPlaying = false
+                            }
+                        }
+                    } else {
+                        self.believedPlayingButStoppedSince = nil
+                    }
+
                     if justStopped {
                         let elapsedAtStop = self.lastKnownElapsedWhilePlaying
+                        let stoppedItemID = self.currentItem?.id
+                        let stoppedAt = Date()
                         // Confirm after 200ms before advancing. Lock/unlock and
                         // foreground transitions can cause transient .paused blips
                         // that recover within ~100ms. A genuine end-of-track stays
@@ -1630,10 +2379,31 @@ final class PlayerViewModel: ObservableObject {
                         // guard below exits early in either false-positive case.
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: 200_000_000)
-                            guard let self,
+                            // A skip that moved on in the meantime makes this edge
+                            // someone else's: advancing on it was a double skip.
+                            guard let self, let stoppedItemID,
+                                  self.currentItem?.id == stoppedItemID,
                                   self.isPlaying,
                                   !self.isPreviewMode,
-                                  !self.isLoadingTrack else { return }
+                                  self.isSettled else { return }
+                            // MusicKit blips playing→paused→playing for 65–370 ms
+                            // on resume and right after a load (device log,
+                            // 2026-10-30). Treating that as a pause flickered ▶/⏸.
+                            // Playing again → it wasn't a stop. Within a moment
+                            // of our own load → it's the load's start-up blip; a
+                            // real pause there is caught by the stalled-state
+                            // reconciliation 1.5 s later.
+                            let live = ApplicationMusicPlayer.shared.state.playbackStatus
+                            guard live == .paused || live == .stopped else { return }
+                            if let loadedAt = self.lastLoadCompletedAt,
+                               stoppedAt.timeIntervalSince(loadedAt) < Self.postLoadBlipWindow { return }
+                            // Same for a pause/play tap moments ago: MusicKit's
+                            // status lags our own pause and resume, so this edge is
+                            // that tap catching up. Acting on it published "paused"
+                            // right after a resume. A genuine stop here is caught by
+                            // the stalled-state reconciliation 1.5 s later.
+                            if let tappedAt = self.lastToggleAt,
+                               Date().timeIntervalSince(tappedAt) < Self.recentToggleWindow { return }
                             // THE PRIMARY CHECK: does this look like the track
                             // actually reached its end? Confirmed via on-device
                             // diagnostic logging that Control Center's pause
@@ -1657,6 +2427,8 @@ final class PlayerViewModel: ObservableObject {
                                 // skipping to the next one.
                                 self.isPlaying = false
                                 self.lastPlaybackStatus = .paused
+                                FieldLog.event("player", "⚠️ stopped mid-track remaining=\(Int(remaining))s hasNext=\(self.hasNext) — treated as pause, not advance \(FieldLog.audioSnapshot())", withMemory: true)
+                                diagLog("stopped mid-track: remaining=\(String(format: "%.1f", remaining))s hasNext=\(self.hasNext) nativeEntries=\(ApplicationMusicPlayer.shared.queue.entries.count) nativeCurrent=\(ApplicationMusicPlayer.shared.queue.currentEntry?.title ?? "nil")")
                                 return
                             }
                             // Looks like a genuine end. Still keep the existing
@@ -1669,9 +2441,7 @@ final class PlayerViewModel: ObservableObject {
                                Date().timeIntervalSince(pausedAt) < Self.explicitPauseGraceWindow {
                                 return
                             }
-                            let confirmed = ApplicationMusicPlayer.shared.state.playbackStatus
-                            guard confirmed == .paused || confirmed == .stopped else { return }
-                            await self.handleTrackEnd()
+                            await self.handleTrackEnd(itemID: stoppedItemID)
                         }
                     }
                 }
@@ -1725,6 +2495,7 @@ final class PlayerViewModel: ObservableObject {
             audioSessionActive = true
         } catch {
             debugLog("[Nodalong.Player] audio session activation failed: \(error)")
+            FieldLog.event("audio", "⚠️ audio session activation failed \(FieldLog.tag(error))")
         }
     }
 
@@ -1734,6 +2505,7 @@ final class PlayerViewModel: ObservableObject {
         // playback (`activateAudioSessionIfNeeded`) so launch never blocks on it.
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.addTarget { [weak self] _ in
+            FieldLog.event("remote", "playCommand")
             Task { @MainActor in await self?.togglePlayPause() }
             return .success
         }
@@ -1743,6 +2515,7 @@ final class PlayerViewModel: ObservableObject {
             // actual race the end-of-track edge detector is vulnerable to.
             // See `lastExplicitPauseAt`'s doc comment.
             self?.markExplicitPause()
+            FieldLog.event("remote", "pauseCommand")
             Task { @MainActor in await self?.togglePlayPause() }
             return .success
         }
@@ -1757,6 +2530,13 @@ final class PlayerViewModel: ObservableObject {
         // the background-audio assertion is never lost.
         center.nextTrackCommand.addTarget { [weak self] _ in
             guard let self, self.hasNext else { return .noSuchContent }
+            // Logged because it is genuinely unclear — and load-bearing —
+            // whether Control Center's next reaches this target or is handled
+            // inside MusicKit against its own queue. If BOTH happen for one
+            // press, our index advances twice per tap and runs off the end of
+            // the queue while the audio is still mid-list.
+            diagLog("remoteCommand: next (index \(self.currentIndex) → \(self.currentIndex + 1))")
+            FieldLog.event("remote", "nextTrackCommand idx=\(self.currentIndex)")
             Task { @MainActor in await self.skipToNext() }
             return .success
         }
@@ -1817,8 +2597,8 @@ final class PlayerViewModel: ObservableObject {
         self.isPlaying       = isPlaying
         self.progress        = progress
         self.currentDuration = 210  // 3.5 min stub for previews
-        self.queue           = queue
-        self.currentIndex    = currentIndex
+        self.queueState      = QueueState(items: queue, currentIndex: currentIndex)
+        syncPublishedQueue()
     }
     #endif
 }

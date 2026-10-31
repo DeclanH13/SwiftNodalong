@@ -40,6 +40,14 @@ public struct RecentAlbum: Identifiable, Hashable, Sendable {
     /// (the two read as duplicates: both are "recent activity," just sliced
     /// at album vs. track level).
     public let totalReplayCount: Int
+    /// `true` when ANY track on the album is explicit — the convention music
+    /// apps use for an album-level mark.
+    ///
+    /// Note `false` is ambiguous: it means "no explicit track" OR "explicit
+    /// data not captured yet" (see `CatalogTrack.isExplicit`). Treating both
+    /// the same way is deliberate — marking an album explicit on incomplete
+    /// data would be worse than marking it late.
+    public let isExplicit: Bool
 }
 
 /// Dedupes recent posts into "which album did I most recently play from,"
@@ -84,7 +92,8 @@ public func recentAlbums(from posts: [Post]) -> [RecentAlbum] {
             isrc: latest.isrc,
             trackTitle: latest.title,
             mostRecentPlayedAt: latest.createdAt,
-            totalReplayCount: groupPosts.reduce(0) { $0 + $1.replayCount }
+            totalReplayCount: groupPosts.reduce(0) { $0 + $1.replayCount },
+            isExplicit: groupPosts.contains(where: \.isExplicit)
         )
     }.sorted { $0.mostRecentPlayedAt > $1.mostRecentPlayedAt }
 }

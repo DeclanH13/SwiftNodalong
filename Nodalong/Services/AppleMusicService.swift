@@ -179,11 +179,49 @@ final class AppleMusicService: ObservableObject, MusicService {
 
     // MARK: - Library
 
+    /// The user's own Apple Music library.
+    ///
+    /// 🔴 Read-only, and deliberately never written anywhere. `LibrarySyncService`
+    /// excludes this from its sync path on purpose — importing someone's whole
+    /// Apple Music library into their Nodalong Shelf would flood it, and the
+    /// Shelf is meant to be a deliberate, curated collection (see `ShelfView`).
+    /// That objection is about *importing*, though, and does not apply to
+    /// reading the library live to seed a discovery run and to know which
+    /// artists the user already owns. The taste lens is the only caller.
+    ///
+    /// Pages rather than taking one 100-item slice: 100 tracks off the top of
+    /// a multi-thousand-track library is close to arbitrary and badly
+    /// under-represents it. `MusicLibraryRequest` is a device-local read, so
+    /// paging costs no network — the bound is memory and time, hence the
+    /// `limit` and the fixed page cap.
+    /// `MusicService`'s own requirement. A defaulted parameter does not
+    /// witness a no-argument protocol requirement, so this stays as its own
+    /// method and forwards. Behaviour is unchanged from before paging existed
+    /// (one 100-item page); it has no callers, and the taste lens uses the
+    /// `limit:` form directly.
     func getSavedTracks() async throws -> [NodalongKit.Song] {
-        var req = MusicLibraryRequest<MusicKit.Song>()
-        req.limit = 100
-        let resp = try await req.response()
-        return resp.items.compactMap { Self.toSong($0) }
+        try await getSavedTracks(limit: 100)
+    }
+
+    func getSavedTracks(limit: Int) async throws -> [NodalongKit.Song] {
+        var out: [NodalongKit.Song] = []
+        let pageSize = 100
+        var offset = 0
+        // Hard bound as well as `limit`, so a library that keeps returning
+        // full pages can't spin here.
+        while out.count < limit, offset < limit {
+            var req = MusicLibraryRequest<MusicKit.Song>()
+            req.limit = min(pageSize, limit - out.count)
+            req.offset = offset
+            let items = try await req.response().items
+            guard !items.isEmpty else { break }
+            out.append(contentsOf: items.compactMap { Self.toSong($0) })
+            // Advance by what Apple actually returned, not by what we asked
+            // for — a short page means the library is exhausted.
+            if items.count < req.limit { break }
+            offset += items.count
+        }
+        return out
     }
 
     func getRecentlyPlayed() async throws -> [NodalongKit.Song] {
@@ -342,6 +380,26 @@ final class AppleMusicService: ObservableObject, MusicService {
         )
     }
 
+    // MARK: - Artists while still typing
+
+    /// Artists for a HALF-TYPED term ("pink floy"). Catalog search is
+    /// term-based and doesn't return the artist until the last word is complete,
+    /// so ask Apple's suggestions endpoint, which is built for partial input:
+    /// first its own top-result artists, else complete the term with its best
+    /// suggestion and search artists for that.
+    func artistCompletions(for term: String) async -> [ArtistResult] {
+        var req = MusicCatalogSearchSuggestionsRequest(term: term, includingTopResultsOfTypes: [MusicKit.Artist.self])
+        req.limit = 5
+        guard let resp = try? await req.response() else { return [] }
+        let top: [ArtistResult] = resp.topResults.compactMap {
+            if case .artist(let a) = $0 { return Self.toArtistResult(a) }
+            return nil
+        }
+        if !top.isEmpty { return top }
+        guard let completed = resp.suggestions.first?.searchTerm, !completed.isEmpty else { return [] }
+        return (try? await searchArtists(completed, maxResults: 3)) ?? []
+    }
+
     // MARK: - Browse
 
     /// Apple Music's own personalized recommendations
@@ -437,29 +495,314 @@ final class AppleMusicService: ObservableObject, MusicService {
         }
     }
 
-    /// Global/storefront Top Charts (`MusicCatalogChartsRequest`, no genre —
-    /// overall chart) — the one Home section with zero personalization,
-    /// what's trending right now rather than anything about this user. Not
-    /// subscription-gated (a catalog browse, same as `searchTracks`).
-    func getTopChartSongs(limit: Int) async throws -> [NodalongKit.Song] {
-        let req = MusicCatalogChartsRequest(types: [MusicKit.Song.self])
+
+    /// The chart for the listener's own city, when Apple publishes one for
+    /// their storefront.
+    ///
+    /// Returns `[]` rather than throwing when there's no city chart — the
+    /// caller hides the section, which is the right outcome for something
+    /// that legitimately doesn't exist everywhere. Worth pairing with Near
+    /// Me: "what's playing around here" is the same question that tab asks.
+    func getCityChartSongs(limit: Int) async -> [NodalongKit.Song] {
+        (try? await chartSongs(kinds: [.cityTop], limit: limit)) ?? []
+    }
+
+    /// The chart for one genre, resolved by name.
+    ///
+    /// `MusicCatalogChartsRequest` wants a `Genre` value, not a string, so
+    /// this resolves one first from the top-level genre list (`Genre`
+    /// conforms to `MusicCatalogTopLevelResourceRequesting`, so a bare
+    /// `MusicCatalogResourceRequest<Genre>()` returns them all). The list is
+    /// small, fixed and cached for the session — the app already captures a
+    /// genre on every track at ingest but until now only used it for one
+    /// Shelf grouping.
+    func getGenreChartSongs(genreName: String, limit: Int) async -> [NodalongKit.Song] {
+        guard !genreName.isEmpty, let genre = await resolveGenre(named: genreName) else { return [] }
+        return (try? await chartSongs(genre: genre, kinds: [.mostPlayed], limit: limit)) ?? []
+    }
+
+    private func chartSongs(
+        genre: MusicKit.Genre? = nil,
+        kinds: [MusicCatalogChartKind],
+        limit: Int
+    ) async throws -> [NodalongKit.Song] {
+        var req = MusicCatalogChartsRequest(genre: genre, kinds: kinds, types: [MusicKit.Song.self])
+        req.limit = limit
         let resp = try await req.response()
         guard let chart = resp.songCharts.first else { return [] }
         return chart.items.prefix(limit).compactMap { Self.toSong($0) }
     }
 
+    /// Session cache for the top-level genre list — a fixed catalog list,
+    /// fetched at most once per launch.
+    private var cachedGenres: [MusicKit.Genre]?
+
+    private func resolveGenre(named name: String) async -> MusicKit.Genre? {
+        if cachedGenres == nil {
+            cachedGenres = (try? await MusicCatalogResourceRequest<MusicKit.Genre>().response().items).map(Array.init)
+        }
+        let target = name.lowercased().trimmingCharacters(in: .whitespaces)
+        return cachedGenres?.first { $0.name.lowercased() == target }
+            ?? cachedGenres?.first { $0.name.lowercased().contains(target) || target.contains($0.name.lowercased()) }
+    }
+
+    /// Apple's own recently-played **containers** — the albums, playlists and
+    /// stations the user was actually listening to, as opposed to the flat
+    /// track list `getRecentlyPlayed()` returns.
+    ///
+    /// This is the thing Home's "Jump Back In" reconstructs by grouping
+    /// Firestore posts into albums. Apple's version knows a playlist was a
+    /// playlist rather than inferring an album from track metadata, and
+    /// includes listening that happened outside Nodalong entirely. Stations
+    /// are dropped: the player is a fixed `[QueueItem]` array and a station
+    /// is continuous, so there's nothing here that could play one.
+    ///
+    /// 🔴 Expect this to be EMPTY for a Nodalong-primary listener, and that
+    /// is correct rather than broken — measured as `0 albums / 0 playlists`
+    /// on a real account that had been playing all session. `playCurrent()`
+    /// sets `player.queue = [singleSong]` on every track by design (our queue
+    /// is the source of truth, MusicKit's is deliberately kept to one entry),
+    /// so Apple never sees a *container* being played and has none to report.
+    /// What this surfaces is specifically listening done in the Music app
+    /// itself — which is real added value, just not for someone who only
+    /// listens here. The section hides itself when empty.
+    /// 🔴 `limit` is hard-capped at 10 by Apple, and exceeding it fails the
+    /// whole request rather than clamping:
+    ///
+    ///     status: 400, code: 40005, "Invalid Parameter Value"
+    ///     "Value must be an integer less than or equal to 10, but was: 20"
+    ///     source: .parameter("limit")
+    ///
+    /// This shipped at 20 and therefore **never returned anything**. The empty
+    /// result was originally explained away as structurally correct (this app
+    /// sets `player.queue = [singleSong]` on every track, so Apple genuinely
+    /// never observes a *container* being played here) — that reasoning is
+    /// still true, but it was not why the count was zero, and it was accepted
+    /// without checking the request had even succeeded. `try?` swallowed the
+    /// error; only the device console showed it.
+    func getRecentlyPlayedContainers(limit: Int = 10) async -> (albums: [AlbumResult], playlists: [PlaylistResult]) {
+        var req = MusicRecentlyPlayedRequest<RecentlyPlayedMusicItem>()
+        // Clamped rather than trusted: a caller passing more than Apple allows
+        // fails the request outright, and `try?` below would hide it.
+        req.limit = min(limit, 10)
+        do {
+            let items = try await req.response().items
+            return Self.splitRecentlyPlayed(items)
+        } catch {
+            diagLog("getRecentlyPlayedContainers failed: \(error)")
+            return ([], [])
+        }
+    }
+
+    private static func splitRecentlyPlayed(
+        _ items: MusicItemCollection<RecentlyPlayedMusicItem>
+    ) -> (albums: [AlbumResult], playlists: [PlaylistResult]) {
+        var albums: [AlbumResult] = []
+        var playlists: [PlaylistResult] = []
+        for item in items {
+            switch item {
+            case .album(let a):    if let r = Self.toAlbumResult(a)    { albums.append(r) }
+            case .playlist(let p): if let r = Self.toPlaylistResult(p) { playlists.append(r) }
+            case .station:         continue
+            @unknown default:      continue
+            }
+        }
+        return (albums, playlists)
+    }
+
     /// Global/storefront popular-albums chart (`MusicCatalogChartsRequest`,
     /// `resp.albumCharts` — verified via a typecheck probe before writing
-    /// this, mirroring `getTopChartSongs`'s song-chart sibling). Deliberately
+    /// this, mirroring the song-chart siblings below). Deliberately
     /// labeled "Popular albums" wherever it's shown, not "New releases" —
     /// this is a popularity chart, not a recency feed, and MusicKit's public
     /// API has no genuine "new releases" endpoint to back that label
-    /// honestly. Not subscription-gated, same as `getTopChartSongs`.
+    /// honestly. Not subscription-gated, same as the chart fetches.
     func getPopularAlbums(limit: Int) async throws -> [AlbumResult] {
         let req = MusicCatalogChartsRequest(types: [MusicKit.Album.self])
         let resp = try await req.response()
         guard let chart = resp.albumCharts.first else { return [] }
         return chart.items.prefix(limit).compactMap { Self.toAlbumResult($0) }
+    }
+
+    /// Latest releases from a set of artist NAMES — the user's own Shelf, at
+    /// the only call site.
+    ///
+    /// MusicKit has no "new releases" endpoint (which is exactly why
+    /// `getPopularAlbums` above is deliberately labelled a popularity chart
+    /// rather than a recency feed). But `Artist.latestRelease` IS a real,
+    /// requestable relationship — verified against the iOS 26.2 SDK's own
+    /// `MusicKit.swiftinterface` before building on it, per this project's
+    /// standing rule about confirming MusicKit surface rather than assuming
+    /// it:
+    ///
+    ///     public var latestRelease: MusicKit.Album? { get }
+    ///     public static let latestRelease: MusicRelationshipProperty<Artist, Album>
+    ///
+    /// So the shape is: resolve each name to a catalog artist id, then ONE
+    /// batched `MusicCatalogResourceRequest(matching:memberOf:)` across all
+    /// of them — not N separate requests.
+    ///
+    /// Name→id resolution goes through `MusicDetailCache.resolveArtistByName`,
+    /// which is already name-keyed, in-flight-shared AND disk-persisted, so
+    /// each artist is cold exactly once ever and free on every later load.
+    /// The fetch closure is byte-identical to `CatalogPrefetch.artistByName`'s
+    /// deliberately: that cache is keyed by name, so a differently-shaped
+    /// fetch would mean whichever caller happened to run first silently won.
+    ///
+    /// Returns `[]` rather than throwing on any failure — this backs one
+    /// optional Home section, and a missing rail is a better outcome than a
+    /// propagating error.
+    /// 🔴 Known limitation, confirmed on device: `latestRelease` does not
+    /// distinguish a genuinely new record from a **reissue**. Apple dates an
+    /// anniversary remaster by its catalog date, so a 2016 album can and does
+    /// come back inside a 60-day window (Mac Miller's *The Divine Feminine*
+    /// was the case that surfaced this). MusicKit exposes no original-release
+    /// date to compare against, so there is no clean way to tell them apart.
+    ///
+    /// Mitigated, not solved, three ways: obvious reissues are dropped by
+    /// keyword (`containsCompilationKeyword` — deluxe/anniversary/remaster/…),
+    /// anything already in the user's Shelf under any edition is dropped by
+    /// the caller, and every tile shows how long ago the release is dated so
+    /// a survivor is at least legible rather than mysterious. A plain-titled
+    /// reissue with no keyword still gets through; that is a real gap.
+    func getNewReleases(
+        fromArtists names: [String],
+        within days: Int = 60,
+        limit: Int = 20
+    ) async -> [AlbumResult]? {
+        let unique = Array(Set(names.filter { !$0.isEmpty }))
+        guard !unique.isEmpty else { return [] }
+        let t0 = Date()
+
+        let ids: [MusicItemID] = await withTaskGroup(of: String?.self) { group in
+            for name in unique {
+                group.addTask {
+                    await MusicDetailCache.shared.resolveArtistByName(name) {
+                        (try? await self.searchAll(name, maxPerType: 1))?.artists.first
+                    }?.id
+                }
+            }
+            var out: [String] = []
+            for await id in group { if let id, !id.isEmpty { out.append(id) } }
+            return out.map { MusicItemID($0) }
+        }
+        guard !ids.isEmpty else { return [] }
+
+        // Batched: this is now asked about up to ~60 artists, and one huge
+        // `memberOf` request is both slower to fail and all-or-nothing.
+        // Chunks run concurrently; a chunk that fails is skipped, and only
+        // ALL of them failing counts as a failure (nil) — see below.
+        var latest: [MusicKit.Album] = []
+        var anySucceeded = false
+        await withTaskGroup(of: [MusicKit.Artist]?.self) { group in
+            for chunk in ids.chunked(into: 25) {
+                group.addTask {
+                    var req = MusicCatalogResourceRequest<MusicKit.Artist>(matching: \.id, memberOf: chunk)
+                    req.properties = [.latestRelease]
+                    guard let items = try? await req.response().items else { return nil }
+                    return Array(items)
+                }
+            }
+            for await artists in group {
+                guard let artists else { continue }
+                anySucceeded = true
+                latest.append(contentsOf: artists.compactMap { $0.latestRelease })
+            }
+        }
+        // nil = "we could not find out", distinct from [] = "nothing is new".
+        // The caller keeps what it is already showing on nil but must CLEAR
+        // on []: a rail that can never become empty is a rail that never
+        // updates, which is exactly how this one went stale for weeks.
+        guard anySucceeded else { return nil }
+
+        let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? .distantPast
+        let recent = latest
+            .filter { ($0.releaseDate ?? .distantPast) >= cutoff }
+            // Reissue guard — see the note above. Reuses the same keyword
+            // list `isBetterRelease` already scores catalog rows with, so
+            // "what counts as a reissue" is defined in exactly one place.
+            .filter { !containsCompilationKeyword($0.title) }
+            .compactMap { Self.toAlbumResult($0) }
+
+        // Dedupe by album id: a split release or a collaboration legitimately
+        // comes back as the latest release of two different artists.
+        var seen = Set<String>()
+        let deduped = recent.filter { seen.insert($0.id).inserted }
+
+        diagLog("getNewReleases(\(unique.count) artists): \(deduped.count) in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+        // `releaseDate` is "yyyy-MM-dd" (see `dateFormatter`), so a plain
+        // string compare sorts correctly without parsing anything back.
+        return Array(deduped.sorted { $0.releaseDate > $1.releaseDate }.prefix(limit))
+    }
+
+    /// Apple's own editorial "New Music Daily" playlist, reduced to the
+    /// albums its songs belong to, in playlist order.
+    ///
+    /// MusicKit has no new-releases request, and Apple's public RSS feeds only
+    /// offer a most-played chart — this editorial playlist, curated by Apple
+    /// Music and refreshed daily, is the closest official thing to the "New
+    /// Music" tab. It's the same for everyone (not personal), which is why it
+    /// is a separate rail from the artist-based `getNewReleases`.
+    ///
+    /// Tries the well-known global playlist id first (one request, no
+    /// guessing), then falls back to a catalog search by name restricted to
+    /// Apple's own curation, so a renamed or storefront-specific variant
+    /// still resolves. nil = could not load; [] = loaded but empty.
+    func getNewMusicDaily(limit: Int = 20) async -> [AlbumResult]? {
+        let t0 = Date()
+        guard let playlist = await findNewMusicDailyPlaylist() else {
+            diagLog("getNewMusicDaily: playlist not found")
+            return nil
+        }
+        var songIds: [MusicItemID] = []
+        for track in playlist.tracks ?? [] {
+            if case .song(let song) = track { songIds.append(song.id) }
+            if songIds.count >= 60 { break }
+        }
+        guard !songIds.isEmpty else { return [] }
+
+        // One batched request for the songs' own `.albums` relationship —
+        // a playlist track doesn't carry its album id.
+        var albums: [AlbumResult] = []
+        var anySucceeded = false
+        for chunk in songIds.chunked(into: 25) {
+            var req = MusicCatalogResourceRequest<MusicKit.Song>(matching: \.id, memberOf: chunk)
+            req.properties = [.albums]
+            guard let songs = try? await req.response().items else { continue }
+            anySucceeded = true
+            // `memberOf` doesn't promise playlist order; restore it.
+            let byId = Dictionary(uniqueKeysWithValues: songs.map { ($0.id.rawValue, $0) })
+            for id in chunk {
+                if let album = byId[id.rawValue]?.albums?.first, let result = Self.toAlbumResult(album) {
+                    albums.append(result)
+                }
+            }
+        }
+        guard anySucceeded else { return nil }
+
+        var seen = Set<String>()
+        let deduped = albums.filter { seen.insert($0.id).inserted }
+        diagLog("getNewMusicDaily: \(deduped.count) albums from \(songIds.count) songs in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+        return Array(deduped.prefix(limit))
+    }
+
+    private func findNewMusicDailyPlaylist() async -> MusicKit.Playlist? {
+        var byId = MusicCatalogResourceRequest<MusicKit.Playlist>(
+            matching: \.id, equalTo: MusicItemID("pl.2b0e6e332fdf4b7a91164da3162127b5")
+        )
+        byId.properties = [.tracks]
+        if let pl = try? await byId.response().items.first { return pl }
+
+        var search = MusicCatalogSearchRequest(term: "New Music Daily", types: [MusicKit.Playlist.self])
+        search.limit = 10
+        guard let hits = try? await search.response().playlists else { return nil }
+        guard let match = hits.first(where: {
+            $0.name.lowercased() == "new music daily"
+                && ($0.curatorName ?? "").lowercased().contains("apple")
+        }) else { return nil }
+        var full = MusicCatalogResourceRequest<MusicKit.Playlist>(matching: \.id, equalTo: match.id)
+        full.properties = [.tracks]
+        return try? await full.response().items.first
     }
 
     func getArtistAlbums(artistId: String) async throws -> [AlbumResult] {
@@ -502,30 +845,19 @@ final class AppleMusicService: ObservableObject, MusicService {
     /// which specific track on a compilation actually features this artist.
     /// Surfacing it as albums (not a guessed song list) is the honest
     /// option.
-    /// Albums + top songs only — the two things an artist screen needs to
-    /// render its primary content. Split from what used to be one combined
-    /// `getArtistDetails` request also fetching `.similarArtists`/
-    /// `.appearsOnAlbums` — on-device diagnostic timing showed the combined
-    /// fetch taking 1.5–2.1s, with the whole screen (including Discography/
-    /// Top Songs) gated behind ALL FOUR relationships resolving even though
-    /// only two of them are needed for what's visible first. See
-    /// `getArtistExtras` for the other two, fetched separately so Discography/
-    /// Top Songs can render as soon as THIS finishes, not waiting on Similar
-    /// Artists/Features On too.
-    /// One round trip, deliberately WITHOUT paginating top songs — see
-    /// `getArtistTopSongsFull` for why. On-device timing showed
-    /// `paginatedTopSongs` alone eating 55–74% of this call's total time
-    /// across three different artists (507–1104ms of 925–1488ms), even
-    /// though a screen only needs ~10 songs to render something real —
-    /// paginating to 30 inside the critical path was pure added latency for
-    /// content that's mostly below the fold anyway.
-    func getArtistCore(artistId: String) async throws -> (
+    /// ONE request, the first relationship page of each (~10 top songs, the
+    /// first batch of albums) — the artist screen's fast first paint.
+    ///
+    /// Not cached and not the source of truth: `getArtistCore` is the
+    /// complete version. The screen shows this immediately and then APPENDS
+    /// the rest from `getArtistCore`, never reordering what this showed.
+    func getArtistFirstPage(artistId: String) async throws -> (
         albums: [AlbumResult],
         topTracks: [NodalongKit.Song]
     ) {
         guard !artistId.isEmpty else { return ([], []) }
         let t0 = Date()
-        defer { diagLog("getArtistCore(\(artistId)): \(Int(Date().timeIntervalSince(t0) * 1000))ms") }
+        defer { diagLog("getArtistFirstPage(\(artistId)): \(Int(Date().timeIntervalSince(t0) * 1000))ms") }
         var req = MusicCatalogResourceRequest<MusicKit.Artist>(
             matching: \.id,
             equalTo: MusicItemID(artistId)
@@ -533,10 +865,41 @@ final class AppleMusicService: ObservableObject, MusicService {
         req.properties = [.albums, .topSongs]
         let resp = try await req.response()
         guard let artist = resp.items.first else { return ([], []) }
-
         let rawAlbums = (artist.albums ?? []).compactMap { Self.toAlbumResult($0) }
         let firstPage = (artist.topSongs ?? []).compactMap { Self.toSong($0) }
         return (dedupeAlbumEditions(rawAlbums), firstPage)
+    }
+
+    /// The artist screen's primary content — COMPLETE (top 30 songs, full
+    /// discography), not a first page.
+    ///
+    /// This used to return only the first relationship page and let the view
+    /// top it up in the background, because paginating inside the critical
+    /// path measured 55–74% of the call. That made the screen visibly
+    /// change a moment after it appeared: the Top Songs pager grew and the
+    /// Discography was re-sorted when the full album list landed. It now
+    /// fetches both complete lists CONCURRENTLY (two independent requests,
+    /// so wall time is the slower one, not the sum) and returns once, so a
+    /// caller — the screen, or a prefetch that warms `MusicDetailCache` —
+    /// only ever sees the final data. Cold cost is a longer first wait,
+    /// paid once per artist; revisits and prefetched artists are cache hits.
+    ///
+    /// Split from `getArtistExtras` (similar artists / features-on) so a
+    /// slower, less-viewed relationship never gates this one.
+    func getArtistCore(artistId: String) async throws -> (
+        albums: [AlbumResult],
+        topTracks: [NodalongKit.Song]
+    ) {
+        guard !artistId.isEmpty else { return ([], []) }
+        let t0 = Date()
+        defer { diagLog("getArtistCore(\(artistId)): \(Int(Date().timeIntervalSince(t0) * 1000))ms") }
+        async let songs: [NodalongKit.Song]? = try? await getArtistTopSongsFull(artistId: artistId)
+        async let albums: [AlbumResult]? = try? await getArtistAlbumsFull(artistId: artistId)
+        let (s, a) = await (songs, albums)
+        // Both failing is a failure the caller should see (and not cache).
+        // One failing returns the other — a partial screen beats none.
+        guard s != nil || a != nil else { throw URLError(.badServerResponse) }
+        return (a ?? [], s ?? [])
     }
 
     /// Background-only top-up: pages the SAME artist's `.albums` relationship
@@ -823,7 +1186,10 @@ final class AppleMusicService: ObservableObject, MusicService {
         // arrives to a warm (or already in-flight) cache.
         if let result {
             let (id, name, artwork) = (result.id, result.name, result.artwork)
-            let tracks = await MusicDetailCache.shared.tracks(albumId: id) { [weak self] in
+            let tracks = await MusicDetailCache.shared.tracks(
+                albumId: id, releaseDate: result.releaseDate, name: name,
+                artist: result.artistName, artwork: artwork
+            ) { [weak self] in
                 guard let self else { return [] }
                 return (try? await self.getAlbumTracks(albumId: id, albumName: name, artwork: artwork)) ?? []
             }
@@ -943,15 +1309,29 @@ final class AppleMusicService: ObservableObject, MusicService {
     /// real catalog id — text search is the only anchor that works for
     /// those). Returns the matched song with `.albums`/`.artists`
     /// relationships loaded.
-    /// Single-entry memo — tapping artist then album (or vice versa) on the
-    /// same Now Playing track used to run this whole id→ISRC→text cascade
-    /// twice, since `resolveAlbum`/`resolveArtists` never shared their
-    /// result. The memoed song already has `.albums`/`.artists` loaded, so
-    /// the second tap costs zero round trips. One entry is deliberate — the
-    /// player shows exactly one track at a time, so there's never a reason
-    /// to remember more than the current one; a new track invalidates it
-    /// automatically since its cascade key won't match.
-    private var detailedSongMemo: (key: String, song: MusicKit.Song)?
+    /// Small memo — tapping artist then album (or vice versa) on the same
+    /// track used to run this whole id→ISRC→text cascade twice, since
+    /// `resolveAlbum`/`resolveArtists` never shared their result. The memoed
+    /// song already has `.albums`/`.artists` loaded, so the second lookup
+    /// costs zero round trips.
+    ///
+    /// It used to hold ONE entry, on the reasoning that the player shows one
+    /// track at a time. That stopped holding once other surfaces prefetch a
+    /// track's destinations too (the "…" menu, a party's hero): a single
+    /// slot let any of them evict the playing track's entry. A handful of
+    /// entries keeps both warm; it's bounded because each holds a MusicKit
+    /// `Song` with relationships loaded.
+    private var detailedSongMemo: [String: MusicKit.Song] = [:]
+    private var detailedSongMemoOrder: [String] = []
+    private static let detailedSongMemoLimit = 8
+
+    private func rememberDetailedSong(_ song: MusicKit.Song, forKey key: String) {
+        if detailedSongMemo[key] == nil { detailedSongMemoOrder.append(key) }
+        detailedSongMemo[key] = song
+        while detailedSongMemoOrder.count > Self.detailedSongMemoLimit {
+            detailedSongMemo[detailedSongMemoOrder.removeFirst()] = nil
+        }
+    }
 
     private func resolveDetailedSong(
         catalogTrackId: String?,
@@ -960,9 +1340,9 @@ final class AppleMusicService: ObservableObject, MusicService {
         artist: String
     ) async -> MusicKit.Song? {
         let key = "\(catalogTrackId ?? "")|\(isrc ?? "")|\(title)|\(artist)"
-        if let memo = detailedSongMemo, memo.key == key {
+        if let memo = detailedSongMemo[key] {
             diagLog("resolveDetailedSong('\(title)'): memo hit")
-            return memo.song
+            return memo
         }
         let t0 = Date()
         defer { diagLog("resolveDetailedSong('\(title)'): total \(Int(Date().timeIntervalSince(t0) * 1000))ms") }
@@ -980,7 +1360,7 @@ final class AppleMusicService: ObservableObject, MusicService {
             var req = MusicCatalogResourceRequest<MusicKit.Song>(matching: \.id, equalTo: MusicItemID(id))
             req.properties = [.albums, .artists]
             if let detailed = try? await req.response().items.first {
-                detailedSongMemo = (key, detailed)
+                rememberDetailedSong(detailed, forKey: key)
                 return detailed
             }
         }
@@ -988,7 +1368,7 @@ final class AppleMusicService: ObservableObject, MusicService {
             var req = MusicCatalogResourceRequest<MusicKit.Song>(matching: \.isrc, equalTo: isrc)
             req.properties = [.albums, .artists]
             if let detailed = try? await req.response().items.first {
-                detailedSongMemo = (key, detailed)
+                rememberDetailedSong(detailed, forKey: key)
                 return detailed
             }
         }
@@ -997,7 +1377,7 @@ final class AppleMusicService: ObservableObject, MusicService {
         search.limit = 1
         if let song = try? await search.response().songs.first,
            let detailed = try? await song.with([.albums, .artists]) {
-            detailedSongMemo = (key, detailed)
+            rememberDetailedSong(detailed, forKey: key)
             return detailed
         }
         return nil
@@ -1033,9 +1413,21 @@ final class AppleMusicService: ObservableObject, MusicService {
             duration:         s.duration.map { Int($0 * 1000) },
             trackNumber:      s.trackNumber,
             albumReleaseDate: s.releaseDate.map { dateFormatter.string(from: $0) },
-            isExplicit:       s.contentRating == .explicit
+            isExplicit:       s.contentRating == .explicit,
+            genres:           normalizedGenres(s.genreNames),
+            // `nil` playParameters is Apple's signal that the track exists in
+            // the catalog but isn't playable yet — a pre-release album's
+            // unreleased tracks, which come back with placeholder titles
+            // ("Track 1", "Track 3") and no duration. Authoritative, where
+            // inferring it from the missing duration would be a guess.
+            isPlayable:       s.playParameters != nil,
+            // Same source as `albumReleaseDate` above, which despite its name
+            // has always held the TRACK's date. Kept as-is there (album
+            // sorting depends on it) and given an accurately-named home here.
+            releaseDate:      s.releaseDate.map { dateFormatter.string(from: $0) }
         )
     }
+
 
     /// Same contract as `toSong` — returns `nil` for empty-identifier
     /// records so they never enter the rest of the app.
@@ -1079,7 +1471,8 @@ final class AppleMusicService: ObservableObject, MusicService {
             totalTracks:   a.trackCount,
             albumType:     albumType,
             sourceService: .appleMusic,
-            isExplicit:    a.contentRating == .explicit
+            isExplicit:    a.contentRating == .explicit,
+            genres:        normalizedGenres(a.genreNames)
         )
     }
 

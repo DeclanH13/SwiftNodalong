@@ -37,6 +37,12 @@ struct NearMeView: View {
     var body: some View {
         NavigationStack(path: $router.nearMePath) {
             VStack(spacing: 0) {
+                // The profile avatar — genuine layout content, never a
+                // floating overlay, so it can't overlap the radius control
+                // or the park canvas below it. Pinned: this screen never
+                // scrolls at all.
+                ProfileAvatarRow()
+
                 // Radius control lives at the top of the content area —
                 // previously this was a `.toolbar(.bottomBar)` item, which
                 // sat behind the MiniPlayerBar + tab bar and was unreachable.
@@ -62,9 +68,8 @@ struct NearMeView: View {
                     }
                 }
             }
-            .background(Color.nodalong.bgBase)
-            .navigationTitle("Near Me")
-            .navigationBarTitleDisplayMode(.inline)
+            .screenBackground()
+            .toolbar(.hidden, for: .navigationBar)
             // Both destinations a follow-list flow needs, registered together on
             // every stack that can host it.
             //
@@ -91,16 +96,22 @@ struct NearMeView: View {
             .navigationDestination(for: AlbumResult.self)  { AlbumDetailSearchView(album: $0) }
             .navigationDestination(for: Playlist.self)     { PlaylistDetailView(playlist: $0) }
             .navigationDestination(for: PendingArtistResolve.self) { pending in
-                ResolvingArtistsView(name: pending.artist) {
+                ResolvingArtistsView(name: pending.artist, cached: cachedPendingArtists(pending, playerVM: playerVM)) {
                     await resolvePendingArtists(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .navigationDestination(for: PendingAlbumResolve.self) { pending in
-                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork) {
+                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork,
+                                   cached: cachedPendingAlbum(pending, playerVM: playerVM)) {
                     await resolvePendingAlbum(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .profileEntryPoint()
+            // `.enablesInteractiveSwipeBack()` only — the profile avatar
+            // itself now lives at the top of this screen's own VStack, not
+            // floating over it. `showsBack: false` — a tab root has nothing
+            // to pop to.
+            .screenControls(showsBack: false)
         }
         // No wrapping `NavigationStack` here anymore, and no
         // `.navigationDestination` — `NearMeUserSheet`'s own "View Profile"
@@ -284,13 +295,19 @@ struct NearMeView: View {
     /// Top-of-content radius control. Always visible, never obstructed by
     /// the tab bar / mini player. `onChange` re-runs the nearby-users fetch
     /// on each step transition.
+    ///
+    /// No background or divider of its own — it sits directly on the
+    /// screen's animated mesh. It used to carry a flat `bgBase` fill and a
+    /// hairline, which read as a solid purple strip cut across the mesh.
+    /// Tinted `textPrimary` rather than `purpleAccent` for the same reason:
+    /// purple-on-purple loses its contrast once the opaque band is gone.
     private var radiusBar: some View {
         HStack(spacing: 12) {
             Image(systemName: "scope")
                 .font(Font.nodalong.captionSemibold)
-                .foregroundStyle(Color.nodalong.purpleAccent)
+                .foregroundStyle(Color.nodalong.textPrimary)
             Slider(value: $radiusDraft, in: 1...50, step: 1)
-                .tint(Color.nodalong.purpleAccent)
+                .tint(Color.nodalong.textPrimary)
                 .onChange(of: radiusDraft) { _, newVal in
                     nearMeVM.radiusKm = newVal
                     if let geohash = locationService.geohash,
@@ -307,12 +324,6 @@ struct NearMeView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(Color.nodalong.bgBase)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.nodalong.bgCard)
-                .frame(height: 0.5)
-        }
     }
 }
 

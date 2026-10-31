@@ -20,12 +20,27 @@ struct ResolvingArtistsView: View {
     @State private var chosen: ArtistResult?
     @State private var notFound = false
 
+    /// See `ResolvingAlbumView.init`. One cached artist lands straight on
+    /// their page; several land straight on the picker.
+    init(name: String, cached: [ArtistResult]? = nil, resolve: @escaping () async -> [ArtistResult]) {
+        self.name = name
+        self.resolve = resolve
+        let cached = cached ?? []
+        _chosen = State(initialValue: cached.count == 1 ? cached[0] : nil)
+        _candidates = State(initialValue: cached.count > 1 ? cached : [])
+    }
+
     var body: some View {
         Group {
             if let chosen {
                 ArtistDetailSearchView(artist: chosen)
             } else if candidates.count > 1 {
-                List(candidates) { artist in
+                List {
+                  // A native section header rather than a pinned title band:
+                  // a bare list of artist names doesn't say what to do with
+                  // them, and this scrolls with the content.
+                  Section("Choose Artist") {
+                   ForEach(candidates) { artist in
                     Button {
                         chosen = artist
                     } label: {
@@ -53,12 +68,13 @@ struct ResolvingArtistsView: View {
                     }
                     .buttonStyle(.plain)
                     .listRowBackground(Color.nodalong.bgCard)
+                   }
+                  }
                 }
                 .listStyle(.insetGrouped)
                 .scrollContentBackground(.hidden)
-                .background(Color.nodalong.bgBase)
-                .navigationTitle("Choose Artist")
-                .navigationBarTitleDisplayMode(.inline)
+                .screenBackground()
+                .screenControls()
             } else {
                 VStack(spacing: 16) {
                     Circle()
@@ -89,11 +105,11 @@ struct ResolvingArtistsView: View {
                 // and below it (the system default in dark mode) instead of
                 // filling the screen.
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .background(Color.nodalong.bgBase)
-                .navigationTitle(name)
-                .navigationBarTitleDisplayMode(.inline)
+                .screenBackground()
+                .screenControls()
             }
         }
+        .toolbar(.hidden, for: .navigationBar)
         .task {
             guard chosen == nil, candidates.isEmpty, !notFound else { return }
             let results = await resolve()

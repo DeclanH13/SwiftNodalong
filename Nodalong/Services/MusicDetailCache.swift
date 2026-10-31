@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import NodalongKit
 
 /// Albums + top tracks — the primary content of an artist screen. Fetched
@@ -58,10 +59,33 @@ actor MusicDetailCache {
     private static let snapshotKey = "musicDetailCache"
     private static let maxPersistedEntries = 300
 
-    private var albumTracks: [String: [Song]] = [:]
+    // Every dictionary a screen reads at INIT time is mirrored into a
+    // lock-protected `Peek` (see `Peek`'s doc comment) via `didSet`, so the
+    // mirror can never drift from the actor's own copy — every mutation
+    // site, including `ReleaseWatch`'s, goes through the setter. `didSet`
+    // does not fire for assignments inside `init`, which is why snapshot
+    // restore mirrors them by hand.
+    private var albumTracks: [String: [Song]] = [:] { didSet { Self.albumTracksPeek.setAll(albumTracks) } }
+
+    /// Albums whose cached track list is incomplete (some track unplayable) and
+    /// when to re-fetch them. A pre-release list was previously served from disk
+    /// forever, so a pre-saved album stayed "unreleased" after release day.
+    /// See `albumRefreshAfter`.
+    struct PendingAlbum: Codable, Sendable, Equatable {
+        let id: String
+        let name: String
+        let artist: String
+        let artwork: String
+        let releaseDate: String?
+        var refreshAfter: Double   // epoch seconds
+        /// Re-fetches so far — caps albums with no known date, which would
+        /// otherwise be re-checked forever (optional so it decodes from older files).
+        var attempts: Int? = nil
+    }
+    private var albumPending: [String: PendingAlbum] = [:] { didSet { Self.albumPendingPeek.setAll(albumPending) } }
     private var albumInFlight: [String: Task<[Song], Never>] = [:]
 
-    private var artistCore: [String: ArtistCoreDetails] = [:]
+    private var artistCore: [String: ArtistCoreDetails] = [:] { didSet { Self.artistCorePeek.setAll(artistCore) } }
     private var artistCoreInFlight: [String: Task<ArtistCoreDetails?, Never>] = [:]
 
     private var artistExtras: [String: ArtistExtraDetails] = [:]
@@ -74,7 +98,7 @@ actor MusicDetailCache {
     /// tracks load (the artist name is already known then), so the actual
     /// tap — routed through the identical cache key — is often already a hit
     /// instead of paying the ~260ms `searchAll` fuzzy-lookup cold.
-    private var artistByName: [String: ArtistResult] = [:]
+    private var artistByName: [String: ArtistResult] = [:] { didSet { Self.artistByNamePeek.setAll(artistByName) } }
     private var artistByNameInFlight: [String: Task<ArtistResult?, Never>] = [:]
 
     /// Caches a full `AppleMusicService.resolveAlbum` RESULT (not just the
@@ -88,23 +112,81 @@ actor MusicDetailCache {
     /// id/ISRC/text-search cascade cold. `resolveAlbum` already awaits its
     /// own track prewarm internally, so a hit here means `tracks(albumId:)`
     /// is warm too.
-    private var resolvedAlbums: [String: AlbumResult] = [:]
+    private var resolvedAlbums: [String: AlbumResult] = [:] { didSet { Self.resolvedAlbumPeek.setAll(resolvedAlbums) } }
+
+    /// `resolveArtists` outcomes keyed by a caller-supplied identity — the
+    /// artist twin of `resolvedAlbums`, used by track-anchored taps (the
+    /// player, the "…" menu, a party) via `resolvePendingArtists`. Session
+    /// only: deliberately not in `Snapshot`, so adding it needs no schema bump.
+    private var resolvedArtistsByKey: [String: [ArtistResult]] = [:] { didSet { Self.resolvedArtistsPeek.setAll(resolvedArtistsByKey) } }
+    private var resolvedArtistsInFlight: [String: Task<[ArtistResult], Never>] = [:]
+
+    // MARK: - Synchronous peeks
+
+    private static let albumTracksPeek     = Peek<[Song]>()
+    private static let albumPendingPeek    = Peek<PendingAlbum>()
+    private static let artistCorePeek      = Peek<ArtistCoreDetails>()
+    private static let artistByNamePeek    = Peek<ArtistResult>()
+    private static let resolvedAlbumPeek   = Peek<AlbumResult>()
+    private static let resolvedArtistsPeek = Peek<[ArtistResult]>()
+
+    /// Cached tracks for an album, readable from a view's `init`. Returns nil
+    /// for an incomplete (pre-release) list that is due a re-fetch, so the
+    /// screen goes through `tracks(albumId:)` and picks up the fresh one.
+    nonisolated static func peekAlbumTracks(albumId: String) -> [Song]? {
+        guard let songs = albumTracksPeek.get(albumId), !songs.isEmpty else { return nil }
+        if let pending = albumPendingPeek.get(albumId), pending.refreshAfter <= Date().timeIntervalSince1970 { return nil }
+        return songs
+    }
+    /// Cached COMPLETE artist core, readable from a view's `init`.
+    nonisolated static func peekCoreSync(artistId: String) -> ArtistCoreDetails? { artistCorePeek.get(artistId) }
+    nonisolated static func peekArtistByName(_ name: String) -> ArtistResult? { artistByNamePeek.get(name) }
+    nonisolated static func peekResolvedAlbum(key: String) -> AlbumResult? { resolvedAlbumPeek.get(key) }
+    nonisolated static func peekResolvedArtists(key: String) -> [ArtistResult]? {
+        guard let hit = resolvedArtistsPeek.get(key), !hit.isEmpty else { return nil }
+        return hit
+    }
+
     private var resolvedAlbumsInFlight: [String: Task<AlbumResult?, Never>] = [:]
 
+    /// Bumped whenever a model persisted in here gains a field whose absence
+    /// changes behaviour rather than merely losing detail.
+    ///
+    /// 🔴 Added after a real failure. `Song` gained `isPlayable`, decoded
+    /// tolerantly as `?? true` (correct — assuming an unknown track is
+    /// unplayable would dim real music). But this cache had ~300 albums on
+    /// disk written before that field existed, so every cached album's tracks
+    /// restored as "playable" and the unreleased-track handling silently did
+    /// nothing on exactly the albums the user had already opened. A tolerant
+    /// default and a versionless disk cache combine into a fix that appears
+    /// not to work.
+    ///
+    /// v3: `artistCore` entries used to hold only a FIRST page of top songs
+    /// and albums, which the artist screen topped up afterwards. They now
+    /// hold the complete lists, so an older entry would be served forever as
+    /// if it were complete.
+    private static let schemaVersion = 3
+
     private struct Snapshot: Codable {
+        /// Absent in v1 snapshots, which is precisely how they're detected.
+        var schemaVersion:  Int?
         var albumTracks:    [String: [Song]]
         var artistCore:     [String: ArtistCoreDetails]
         var artistExtras:   [String: ArtistExtraDetails]
         var artistByName:   [String: ArtistResult]
         var resolvedAlbums: [String: AlbumResult]
+        /// Optional so snapshots written before it existed still load.
+        var albumPending:   [String: PendingAlbum]
 
         private enum CodingKeys: String, CodingKey {
-            case albumTracks, artistCore, artistExtras, artistByName, resolvedAlbums
+            case schemaVersion, albumTracks, artistCore, artistExtras, artistByName, resolvedAlbums, albumPending
         }
 
         init(albumTracks: [String: [Song]], artistCore: [String: ArtistCoreDetails],
              artistExtras: [String: ArtistExtraDetails], artistByName: [String: ArtistResult],
-             resolvedAlbums: [String: AlbumResult]) {
+             resolvedAlbums: [String: AlbumResult], albumPending: [String: PendingAlbum]) {
+            self.albumPending = albumPending
+            self.schemaVersion = MusicDetailCache.schemaVersion
             self.albumTracks = albumTracks
             self.artistCore = artistCore
             self.artistExtras = artistExtras
@@ -119,26 +201,89 @@ actor MusicDetailCache {
         // artist entry rather than just starting this one dict fresh.
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
+            schemaVersion  = try c.decodeIfPresent(Int.self, forKey: .schemaVersion)
             albumTracks    = try c.decode([String: [Song]].self, forKey: .albumTracks)
             artistCore     = try c.decode([String: ArtistCoreDetails].self, forKey: .artistCore)
             artistExtras   = try c.decode([String: ArtistExtraDetails].self, forKey: .artistExtras)
             artistByName   = try c.decode([String: ArtistResult].self, forKey: .artistByName)
             resolvedAlbums = try c.decodeIfPresent([String: AlbumResult].self, forKey: .resolvedAlbums) ?? [:]
+            albumPending   = try c.decodeIfPresent([String: PendingAlbum].self, forKey: .albumPending) ?? [:]
         }
     }
 
     private init() {
+        // Don't lose a pending write if iOS suspends or kills the app.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
+        ) { _ in Task { await MusicDetailCache.shared.flushPending() } }
         if let snap = SnapshotStore.load(Snapshot.self, key: Self.snapshotKey, uid: Self.catalogSnapshotUid) {
+            // A snapshot from an older schema is discarded rather than
+            // restored: its rows decode "successfully" with defaults for any
+            // field added since, which is worse than a cache miss because the
+            // defaults are silently wrong. Everything here is re-fetchable
+            // catalog data, so throwing it away costs one cold load per album.
+            guard snap.schemaVersion == Self.schemaVersion else {
+                diagLog("MusicDetailCache: discarding v\(snap.schemaVersion.map(String.init) ?? "1") snapshot (current v\(Self.schemaVersion))")
+                return
+            }
             albumTracks    = snap.albumTracks
             artistCore     = snap.artistCore
             artistExtras   = snap.artistExtras
             artistByName   = snap.artistByName
             resolvedAlbums = snap.resolvedAlbums
+            albumPending   = snap.albumPending
+            // Lists cached BEFORE pending-tracking existed (the pre-saved album
+            // that prompted it) have unplayable tracks but no entry, so would
+            // never expire. Adopt them as due now; the watch re-checks them on
+            // the next foreground / Home load and drops the entry once they're
+            // fully playable.
+            for (id, songs) in albumTracks where albumPending[id] == nil && songs.contains(where: { !$0.isPlayable }) {
+                guard let first = songs.first else { continue }
+                albumPending[id] = PendingAlbum(
+                    id: id, name: first.album, artist: first.artist, artwork: first.artwork,
+                    releaseDate: nil, refreshAfter: Date().timeIntervalSince1970, attempts: 0
+                )
+            }
+            // `didSet` doesn't run for assignments made in `init`, so the
+            // restored dictionaries are mirrored here by hand.
+            Self.albumTracksPeek.setAll(albumTracks)
+            Self.albumPendingPeek.setAll(albumPending)
+            Self.artistCorePeek.setAll(artistCore)
+            Self.artistByNamePeek.setAll(artistByName)
+            Self.resolvedAlbumPeek.setAll(resolvedAlbums)
             diagLog("MusicDetailCache: restored \(albumTracks.count) albums, \(artistCore.count) artists from disk")
         }
     }
 
+    /// Coalesced: a prefetch burst fills the cache dozens of times, and each
+    /// fill used to re-encode and atomically rewrite the WHOLE ~11 MB snapshot —
+    /// ≈1 GB of disk writes in a day (MetricKit disk-write exception). Writes now
+    /// happen at most once per `persistDelay`, and `flushPending()` (called when
+    /// the app backgrounds) guarantees nothing is lost to a kill.
+    private var persistTask: Task<Void, Never>?
+    private var persistDirty = false
+    private static let persistDelay: UInt64 = 5_000_000_000
+
     private func persist() {
+        persistDirty = true
+        persistTask?.cancel()
+        persistTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.persistDelay)
+            guard !Task.isCancelled else { return }
+            await self?.flushPending()
+        }
+    }
+
+    /// Writes immediately if anything changed since the last write.
+    func flushPending() {
+        persistTask?.cancel()
+        persistTask = nil
+        guard persistDirty else { return }
+        persistDirty = false
+        persistNow()
+    }
+
+    private func persistNow() {
         func capped<V>(_ dict: [String: V]) -> [String: V] {
             guard dict.count > Self.maxPersistedEntries else { return dict }
             return Dictionary(uniqueKeysWithValues: Array(dict.prefix(Self.maxPersistedEntries)))
@@ -148,7 +293,8 @@ actor MusicDetailCache {
             artistCore:     capped(artistCore),
             artistExtras:   capped(artistExtras),
             artistByName:   capped(artistByName),
-            resolvedAlbums: capped(resolvedAlbums)
+            resolvedAlbums: capped(resolvedAlbums),
+            albumPending:   albumPending
         )
         SnapshotStore.save(snap, key: Self.snapshotKey, uid: Self.catalogSnapshotUid)
     }
@@ -200,13 +346,47 @@ actor MusicDetailCache {
         return result
     }
 
+    /// `resolvedAlbum`'s artist twin — see `resolvedArtistsByKey`.
+    func resolvedArtists(forKey key: String, fetch: @escaping @Sendable () async -> [ArtistResult]) async -> [ArtistResult] {
+        if let hit = resolvedArtistsByKey[key], !hit.isEmpty { return hit }
+        if let inFlight = resolvedArtistsInFlight[key] { return await inFlight.value }
+        let task = Task { await fetch() }
+        resolvedArtistsInFlight[key] = task
+        let result = await task.value
+        resolvedArtistsInFlight[key] = nil
+        if !result.isEmpty { resolvedArtistsByKey[key] = result }
+        return result
+    }
+
+    /// Seeds a resolve result that was obtained elsewhere (the player's own
+    /// prefetch), so every entry point sharing `key` sees it.
+    func seedResolved(album: AlbumResult?, artists: [ArtistResult], forKey key: String) {
+        if let album { resolvedAlbums[key] = album; persist() }
+        if !artists.isEmpty { resolvedArtistsByKey[key] = artists }
+    }
+
     /// Returns the cached tracks for `albumId`, or runs `fetch` — shared
     /// across any concurrent callers for the same id (e.g. a
     /// `ResolvingAlbumView` warm-up racing the detail screen's own `.task`).
-    func tracks(albumId: String, fetch: @escaping @Sendable () async -> [Song]) async -> [Song] {
+    ///
+    /// **Incomplete lists expire.** If the fetched list has any unplayable track
+    /// (an unreleased or partly released album) the album is remembered in
+    /// `albumPending` with a `refreshAfter` time — the release date, or hourly
+    /// once that has passed — and a hit past that time is treated as a miss. Pass
+    /// the album's `releaseDate` (and name/artist/artwork, so `ReleaseWatch` can
+    /// re-fetch it without a screen open); all optional so existing callers work.
+    func tracks(
+        albumId: String,
+        releaseDate: String? = nil, name: String = "", artist: String = "", artwork: String = "",
+        fetch: @escaping @Sendable () async -> [Song]
+    ) async -> [Song] {
         if let hit = albumTracks[albumId] {
-            diagLog("MusicDetailCache.tracks(\(albumId)): cache hit")
-            return hit
+            let due = albumPending[albumId].map { $0.refreshAfter <= Date().timeIntervalSince1970 } ?? false
+            if !due {
+                diagLog("MusicDetailCache.tracks(\(albumId)): cache hit")
+                return hit
+            }
+            diagLog("MusicDetailCache.tracks(\(albumId)): pending album is due — refetching")
         }
         if let inFlight = albumInFlight[albumId] { return await inFlight.value }
         let t0 = Date()
@@ -217,9 +397,58 @@ actor MusicDetailCache {
         albumInFlight[albumId] = nil
         if !result.isEmpty {
             albumTracks[albumId] = result
+            let known = albumPending[albumId]
+            let attempts = (known?.attempts ?? 0) + (known == nil ? 0 : 1)
+            let knownDate = releaseDate ?? known?.releaseDate
+            // No date to anchor on and already re-checked a few times: give up.
+            let giveUp = knownDate == nil && attempts >= 3
+            if !giveUp, let after = albumRefreshAfter(
+                releaseDate: knownDate,
+                hasUnplayable: result.contains { !$0.isPlayable }
+            ) {
+                albumPending[albumId] = PendingAlbum(
+                    id: albumId,
+                    name: name.isEmpty ? (known?.name ?? "") : name,
+                    artist: artist.isEmpty ? (known?.artist ?? "") : artist,
+                    artwork: artwork.isEmpty ? (known?.artwork ?? "") : artwork,
+                    releaseDate: releaseDate ?? known?.releaseDate,
+                    refreshAfter: after.timeIntervalSince1970,
+                    attempts: attempts
+                )
+            } else {
+                albumPending[albumId] = nil
+            }
             persist()
         }
         return result
+    }
+
+    // MARK: - Apple playlist tracks (session-only)
+
+    /// Lock-protected mirror so a view can seed its state in `init` without an
+    /// actor hop (an `await` here always paints the first frame empty).
+    private static let playlistPeek = Peek<[Song]>()
+    private var playlistInFlight: [String: Task<[Song], Never>] = [:]
+
+    nonisolated static func peekPlaylistTracks(id: String) -> [Song]? { playlistPeek.get(id) }
+
+    /// Tracks of an Apple Music playlist (a Made For You mix etc.), shared across
+    /// concurrent callers like the album/artist caches. Session-only: Apple
+    /// updates these playlists, and nothing here is expensive to re-fetch.
+    func playlistTracks(id: String, fetch: @escaping @Sendable () async -> [Song]) async -> [Song] {
+        if let hit = Self.playlistPeek.get(id) { return hit }
+        if let inFlight = playlistInFlight[id] { return await inFlight.value }
+        let task = Task { await fetch() }
+        playlistInFlight[id] = task
+        let result = await task.value
+        playlistInFlight[id] = nil
+        if !result.isEmpty { Self.playlistPeek.set(id, result) }
+        return result
+    }
+
+    /// Albums whose incomplete list is now due to be re-fetched.
+    func pendingDue(now: Date = Date()) -> [PendingAlbum] {
+        albumPending.values.filter { $0.refreshAfter <= now.timeIntervalSince1970 && !$0.name.isEmpty }
     }
 
     func core(artistId: String, fetch: @escaping @Sendable () async -> ArtistCoreDetails?) async -> ArtistCoreDetails? {
@@ -244,27 +473,6 @@ actor MusicDetailCache {
         return result
     }
 
-    /// Merges a background top-up of top tracks (first page → up to 30) into
-    /// an already-cached artist's core details, so a later revisit gets the
-    /// full list too. No-op if this artist was never core-cached — the
-    /// top-up simply has nothing to merge into.
-    func updateTopTracks(artistId: String, topTracks: [Song]) {
-        guard let existing = artistCore[artistId] else { return }
-        artistCore[artistId] = ArtistCoreDetails(albums: existing.albums, topTracks: topTracks)
-        persist()
-    }
-
-    /// Merges a background top-up of the full (paginated) album list into an
-    /// already-cached artist's core details — the `albums` counterpart to
-    /// `updateTopTracks` above, closing the identical gap `getArtistCore`'s
-    /// own `.albums` relationship had (see `getArtistAlbumsFull`'s doc
-    /// comment). No-op if this artist was never core-cached.
-    func updateAlbums(artistId: String, albums: [AlbumResult]) {
-        guard let existing = artistCore[artistId] else { return }
-        artistCore[artistId] = ArtistCoreDetails(albums: albums, topTracks: existing.topTracks)
-        persist()
-    }
-
     func extras(artistId: String, fetch: @escaping @Sendable () async -> ArtistExtraDetails?) async -> ArtistExtraDetails? {
         if let hit = artistExtras[artistId] { return hit }
         if let inFlight = artistExtrasInFlight[artistId] { return await inFlight.value }
@@ -278,4 +486,16 @@ actor MusicDetailCache {
         }
         return result
     }
+}
+
+/// Lock-protected key/value mirror so a view can seed its state in `init`
+/// without an actor hop — an `await` always paints the first frame empty,
+/// which is the difference between a warm screen and one that flashes a
+/// skeleton for a frame and cross-fades out of it.
+final class Peek<V: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var store: [String: V] = [:]
+    func get(_ key: String) -> V? { lock.lock(); defer { lock.unlock() }; return store[key] }
+    func set(_ key: String, _ value: V) { lock.lock(); store[key] = value; lock.unlock() }
+    func setAll(_ all: [String: V]) { lock.lock(); store = all; lock.unlock() }
 }

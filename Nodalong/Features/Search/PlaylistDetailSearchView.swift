@@ -13,8 +13,6 @@ struct PlaylistDetailSearchView: View {
     @EnvironmentObject private var musicService:   AppleMusicService
     @EnvironmentObject private var spotifyService: SpotifyMusicService
     @EnvironmentObject private var playerVM:  PlayerViewModel
-    @EnvironmentObject private var libraryVM: LibraryViewModel
-    @Environment(FirebaseAuthViewModel.self) private var authVM
 
     /// Whichever backend is actually connected — browsing must route here,
     /// not hardcode Apple Music.
@@ -22,14 +20,23 @@ struct PlaylistDetailSearchView: View {
         activeMusicService(playerVM: playerVM, apple: musicService, spotify: spotifyService)
     }
 
-    @State private var tracks: [Song] = []
+    @State private var tracks: [Song]
     @State private var isLoading = false
 
+    /// Seeds from a prefetched track list synchronously so a warmed playlist
+    /// opens with its tracks on the first frame.
+    init(playlist: PlaylistResult) {
+        self.playlist = playlist
+        _tracks = State(initialValue: MusicDetailCache.peekPlaylistTracks(id: playlist.id) ?? [])
+    }
+
     var body: some View {
+        VStack(spacing: 0) {
         List {
             Section {
                 HStack(spacing: 16) {
                     ArtworkThumbnail(url: playlist.artwork, size: 80)
+                        .clipShape(RoundedRectangle(cornerRadius: Corner.playlistCover, style: .continuous))
                     VStack(alignment: .leading, spacing: 4) {
                         Text(playlist.name)
                             .font(Font.nodalong.title3Bold)
@@ -46,7 +53,7 @@ struct PlaylistDetailSearchView: View {
                     }
                 }
                 .padding(.vertical, 8)
-                .listRowBackground(Color.nodalong.bgBase)
+                .listRowBackground(Color.clear)
 
                 Button {
                     guard activeService.isAuthenticated, !tracks.isEmpty else { return }
@@ -59,7 +66,7 @@ struct PlaylistDetailSearchView: View {
                         .padding(.vertical, 10)
                 }
                 .disabled(tracks.isEmpty)
-                .listRowBackground(Color.nodalong.bgBase)
+                .listRowBackground(Color.clear)
             }
 
             Section("Tracks") {
@@ -77,26 +84,29 @@ struct PlaylistDetailSearchView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
-        .background(Color.nodalong.bgBase)
+        .screenBackground()
         // Same reasoning as AlbumDetailSearchView: a safeAreaInset (not a
         // trailing transparent row) so `.insetGrouped`'s bottom-corner
         // rounding always lands on the real last track row.
         .safeAreaInset(edge: .bottom) {
             if playerVM.nowPlaying != nil { Color.clear.frame(height: 70) }
         }
-        .navigationTitle(playlist.name)
-        .navigationBarTitleDisplayMode(.inline)
+        }
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        .screenControls()
         .task {
             guard tracks.isEmpty else { return }
             isLoading = true
-            tracks = (try? await musicService.getPlaylistTracks(playlistId: playlist.id)) ?? []
+            tracks = await MusicDetailCache.shared.playlistTracks(id: playlist.id) {
+                (try? await musicService.getPlaylistTracks(playlistId: playlist.id)) ?? []
+            }
             isLoading = false
         }
     }
 
     @ViewBuilder
     private func playlistTrackRow(track: Song, index: Int) -> some View {
-        let isLiked = libraryVM.isInLibrary(catalogId: track.catalogId, uri: track.uri)
         HStack(spacing: 12) {
             // Circular artwork instead of a track number — playlist order
             // isn't a meaningful "position" the way an album track number is,
@@ -122,25 +132,7 @@ struct PlaylistDetailSearchView: View {
             }
             TrackActionsMenuButton(
                 song:         track,
-                onAddToQueue: { playerVM.addToQueue(track) },
-                onToggleLike: {
-                    guard let uid = authVM.currentUser?.uid else { return }
-                    let doc = LibraryTrackDoc(
-                        catalogId:     track.catalogId ?? "",
-                        title:         track.title,
-                        artist:        track.artist,
-                        album:         track.album,
-                        artwork:       track.artwork,
-                        uri:           track.uri,
-                        sourceService: .appleMusic,
-                        isrc:          track.isrc,
-                        duration:      track.duration,
-                        trackNumber:   track.trackNumber,
-                        savedAt:       Date().timeIntervalSince1970 * 1000
-                    )
-                    Task { await libraryVM.toggleLibrary(uid: uid, track: doc) }
-                },
-                isLiked: isLiked
+                onAddToQueue: { playerVM.addToQueue(track) }
             )
         }
         .contentShape(.rect)

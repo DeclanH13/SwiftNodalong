@@ -9,17 +9,25 @@ import NodalongKit
 struct RecommendedForYouView: View {
     @EnvironmentObject private var musicService: AppleMusicService
 
-    /// Shares `HomeView.zoomNamespace` — this screen is always pushed onto
-    /// Home's own `NavigationStack`, so its tap→open zoom transitions must
-    /// use the same namespace Home's `.navigationDestination(for:)` expects.
-    let namespace: Namespace.ID
+    @State private var shelves: [RecommendationShelf]
+    @State private var isLoading: Bool
 
-    @State private var shelves: [RecommendationShelf] = []
-    @State private var isLoading = true
+    /// Seeds from what Home warmed in the background
+    /// (`HomeViewModel.allRecommendationShelves`), so the screen opens
+    /// populated instead of on a spinner. Taken as a parameter rather than
+    /// read from the environment so the seed is in place for the first frame.
+    init(prefetched: [RecommendationShelf] = []) {
+        _shelves = State(initialValue: prefetched)
+        _isLoading = State(initialValue: prefetched.isEmpty)
+    }
 
     var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                // In-content heading: the shelves below are titled
+                // individually, so nothing else names the screen itself.
+                ScreenTitle("Recommended for You")
                 if isLoading {
                     ProgressView()
                         .frame(maxWidth: .infinity)
@@ -31,20 +39,22 @@ struct RecommendedForYouView: View {
                                 .font(Font.nodalong.headline)
                                 .foregroundStyle(Color.nodalong.textPrimary)
                                 .padding(.horizontal, 16)
-                            AlbumsCarousel(albums: shelf.albums, namespace: namespace)
+                            AlbumsCarousel(albums: shelf.albums)
                         }
                     }
                 }
             }
             .padding(.vertical, 16)
         }
-        .background(Color.nodalong.bgBase)
-        .navigationTitle("Recommended for You")
-        .navigationBarTitleDisplayMode(.inline)
+        }
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        .screenControls()
         // No `.navigationDestination(for: AlbumResult.self)` here — this
         // view is always pushed onto HomeView's own NavigationStack, which
         // already declares that destination; a duplicate would be redundant.
         .task {
+            guard shelves.isEmpty else { return }
             shelves = (try? await musicService.getPersonalRecommendations(maxGroups: 10)) ?? []
             isLoading = false
         }
@@ -52,17 +62,10 @@ struct RecommendedForYouView: View {
 }
 
 #if DEBUG
-private struct RecommendedForYouPreviewHost: View {
-    @Namespace private var namespace
-    var body: some View {
-        NavigationStack {
-            RecommendedForYouView(namespace: namespace)
-        }
-        .withPreviewEnvironment()
-    }
-}
-
 #Preview {
-    RecommendedForYouPreviewHost()
+    NavigationStack {
+        RecommendedForYouView()
+    }
+    .withPreviewEnvironment()
 }
 #endif
