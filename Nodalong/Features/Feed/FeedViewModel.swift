@@ -17,8 +17,41 @@ import NodalongKit
 /// Drives: FeedView's list. Tap → `PlayerViewModel.play()` + `tryNod()`.
 @MainActor
 final class FeedViewModel: ObservableObject {
-    @Published private(set) var posts:    [Post] = []
+    @Published private(set) var posts:    [Post] = [] { didSet { PublishCounter.bump("feed.posts"); recomputeDerived() } }
     @Published private(set) var isLoading       = false
+
+    /// Album-level: people you follow, ranked by how many of them played
+    /// something from this album. Home shows the top 10; the see-all screen
+    /// shows them all, so this is published uncapped.
+    @Published private(set) var friendsListeningAlbums: [FriendsListeningAlbum] = []
+
+    /// Track-level: the most-nodded tracks among people you follow in the
+    /// last 7 days. Same source as above, different aggregation.
+    @Published private(set) var mostNoddedThisWeek: [Post] = []
+
+    /// Derived once per change to `posts`, never from a view body.
+    ///
+    /// Both aggregations build dictionaries and sort over the whole feed —
+    /// up to 100 posts — and `HomeView` read them from computed properties,
+    /// so each ran TWICE per render there (once for the section-availability
+    /// check, once for the section body) plus a third time uncapped on the
+    /// see-all screen. `HomeView` observes nine app-wide objects, so a
+    /// `isPlaying` toggle was re-aggregating the entire feed four times.
+    ///
+    /// A `didSet` rather than per-call-site memoisation for the same reason
+    /// `LibraryViewModel.recomputeDerived()` uses one: `posts` is assigned or
+    /// mutated in six places here (snapshot restore, load, refresh, and the
+    /// optimistic nod bump plus its two rollbacks), and a `didSet` means none
+    /// of them can forget.
+    ///
+    /// The 7-day cutoff is therefore evaluated when `posts` changes rather
+    /// than per render. `posts` is reassigned on load, on pull-to-refresh and
+    /// on foreground-return, so the window stays current in practice.
+    private func recomputeDerived() {
+        friendsListeningAlbums = NodalongKit.friendsListeningAlbums(from: posts)
+        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600).timeIntervalSince1970 * 1000
+        mostNoddedThisWeek = NodalongKit.mostNoddedPosts(from: posts, since: cutoff, limit: 10)
+    }
 
     /// Session-only set of `(nodder)_(source)_(track)` keys we've already
     /// awarded a nod for today. Backed by `nod_records/{nodder}_{source}_{track}_{day}`

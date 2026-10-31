@@ -15,6 +15,10 @@ struct MainTabView: View {
     @StateObject private var playlistsVM = PlaylistsViewModel()
     @StateObject private var partyVM     = ListeningPartyViewModel()
     @StateObject private var homeVM      = HomeViewModel()
+    @StateObject private var inboxVM     = InboxViewModel()
+    @StateObject private var tasteStore  = TasteOverridesStore()
+    @State private var liveActivity      = LiveActivityCoordinator()
+    @State private var widgetSync        = WidgetSync()
     /// Owns which tab is selected and each tab's own `NavigationPath` — see
     /// its own doc comment for why this replaced a private `@State var
     /// selectedTab` and 4 independent per-tab private `@State var path`s.
@@ -44,7 +48,16 @@ struct MainTabView: View {
         // visually separated trailing circle, matching Apple Music's own
         // tab bar exactly. Profile stays a persistent per-tab entry point
         // (`.profileEntryPoint()`, applied inside Home/Feed/NearMe/Shelf).
-        TabView(selection: $router.selectedTab) {
+        //
+        // The selection goes through a wrapper binding so a tap on the tab
+        // you're ALREADY on is observable: the setter fires with a value equal
+        // to the current one. Whether iOS 26's `Tab` API still calls the
+        // setter for a re-tap is exactly what step 0 of the tab-reselect plan
+        // is checking — see `AppRouter.tabSelectionSet`.
+        TabView(selection: Binding(
+            get: { router.selectedTab },
+            set: { router.tabSelectionSet($0) }
+        )) {
             Tab("Home", systemImage: "house.fill", value: AppRouter.Tab.home) {
                 HomeView()
             }
@@ -132,7 +145,15 @@ struct MainTabView: View {
         .environmentObject(playlistsVM)
         .environmentObject(partyVM)
         .environmentObject(homeVM)
+        .environmentObject(inboxVM)
+        .environmentObject(tasteStore)
         .environmentObject(router)
+        .task(id: authVM.currentUser?.uid) {
+            if let uid = authVM.currentUser?.uid { inboxVM.start(uid: uid); tasteStore.start(uid: uid); PlaylistTracksCache.configure(uid: uid) } else { inboxVM.stop(); tasteStore.stop(); PlaylistTracksCache.reset() }
+        }
+        .task { liveActivity.start(playerVM: playerVM, partyVM: partyVM) }
+        .task { widgetSync.start(playerVM: playerVM, homeVM: homeVM) }
+        .task { await searchVM.warmPopularAlbums(musicService: musicService) }
     }
 }
 

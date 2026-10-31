@@ -17,7 +17,7 @@ let package = Package(
         .testTarget(
             name: "NodalongKitTests",
             dependencies: ["NodalongKit"],
-            path: "Tests/NodalongKitTests"
+            path: "Tests/NodalongKitTests" 
         )
     ]
 )

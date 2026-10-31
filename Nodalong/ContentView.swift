@@ -13,6 +13,7 @@ struct ContentView: View {
     @EnvironmentObject private var spotifyService: SpotifyMusicService
     @EnvironmentObject private var syncService:   LibrarySyncService
     @EnvironmentObject private var playerVM:     PlayerViewModel
+    @EnvironmentObject private var libraryVM:    LibraryViewModel
     @EnvironmentObject private var nowPlayingBroadcast: NowPlayingBroadcastService
     @EnvironmentObject private var syncCoordinator: SyncFollowCoordinator
 
@@ -169,6 +170,10 @@ struct ContentView: View {
         // already started or if RTDB isn't provisioned.
         .task {
             nowPlayingBroadcast.start(playerVM: playerVM, authVM: authVM)
+            // Give the Taptic Engine a head start, so the first haptic of the
+            // session doesn't block the main thread spinning it up. See
+            // `Haptics`.
+            Haptics.prepare(.light)
         }
         // Self-heal: end any of my own party docs still marked `.live` from a
         // previous process (crash/force-quit before `endParty` ever ran — the
@@ -187,7 +192,12 @@ struct ContentView: View {
         // session's data until the network caught up. Warming here means the
         // bundle and both follow lists are resolved before you ever tap the
         // avatar. Fire-and-forget: nothing on screen awaits it.
-        .task {
+        //
+        // Keyed on the uid, not a plain `.task`: on a launch where the
+        // signed-in user isn't restored synchronously, the uid is still nil
+        // when this first runs, and a one-shot task then skipped the warm-up
+        // for the whole session.
+        .task(id: authVM.currentUser?.uid) {
             guard let uid = authVM.currentUser?.uid else { return }
             SocialCache.shared.prefetch(uid: uid, viewerUid: uid)
             SocialCache.shared.prefetchFollowLists(uid: uid)
@@ -255,6 +265,8 @@ struct ContentView: View {
             // Spotify app (manually, or via the alert's "Open Spotify"
             // button). No-ops when there's nothing pending.
             Task { await playerVM.retryAfterSpotifyDeviceRecovery() }
+            // Pre-saved albums whose release date has passed fill in by themselves.
+            Task { await ReleaseWatch.checkDue(musicService: musicService, libraryVM: libraryVM) }
         }
     }
 }

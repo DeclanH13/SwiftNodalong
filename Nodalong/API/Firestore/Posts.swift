@@ -323,3 +323,49 @@ private func mapRecentTrack(
         trackId:       doc.documentID
     )
 }
+
+
+// MARK: - Nod graph
+
+/// One person who has nodded this user's tracks, and how often.
+struct Nodder {
+    let uid: String
+    /// Distinct (track, day) nods they've given this user — the "they liked
+    /// yours" lens skews by this, so someone who nodded twelve of your tracks
+    /// outranks someone who nodded one.
+    let nodCount: Int
+    /// Epoch ms of their most recent nod, for recency decay.
+    let lastNodAt: Double
+}
+
+/// Everyone who has nodded `sourceUid`'s tracks.
+///
+/// `nod_records` has been written since nods shipped but never read back for
+/// anything — this is its first consumer. A nod is one of the few genuinely
+/// *explicit* signals in the app (someone heard your track and deliberately
+/// reacted), which makes it a strong basis for "these people like what you play".
+///
+/// Single-field equality query, so Firestore's automatic index covers it — no
+/// composite index to deploy. Capped because this only needs enough people to
+/// rank, not the complete history.
+func getNodders(sourceUid: String, limit: Int = 200) async throws -> [Nodder] {
+    let snap = try await Firestore.firestore()
+        .collection("nod_records")
+        .whereField("sourceUid", isEqualTo: sourceUid)
+        .limit(to: limit)
+        .getDocuments()
+
+    var counts: [String: (count: Int, last: Double)] = [:]
+    for doc in snap.documents {
+        let data = doc.data()
+        guard let nodder = data["nodderUid"] as? String, !nodder.isEmpty, nodder != sourceUid
+        else { continue }
+        let createdAt = data["createdAt"] as? Double ?? 0
+        let existing = counts[nodder] ?? (0, 0)
+        counts[nodder] = (existing.count + 1, max(existing.last, createdAt))
+    }
+
+    return counts
+        .map { Nodder(uid: $0.key, nodCount: $0.value.count, lastNodAt: $0.value.last) }
+        .sorted { $0.nodCount == $1.nodCount ? $0.uid < $1.uid : $0.nodCount > $1.nodCount }
+}

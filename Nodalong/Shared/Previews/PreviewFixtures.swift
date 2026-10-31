@@ -330,10 +330,18 @@ extension View {
             .environmentObject(PlaylistsViewModel.mockPreview)
             .environmentObject(ListeningPartyViewModel.mockPreview)
             .environmentObject(HomeViewModel.mockPreview)
+            .environmentObject(InboxViewModel.mockPreview)
+            .environmentObject(TasteOverridesStore.mockPreview)
             .environmentObject(NowPlayingBroadcastService())
             .environmentObject(SyncFollowCoordinator())
             .environmentObject(LibrarySyncService())
             .environmentObject(LocationService())
+            .environmentObject(PlaylistGenerator())
+            .environmentObject(HomeLayoutPreferences.mockPreview)
+            // Pre-existing gap: HomeView has required AppRouter since the
+            // router migration but it was never registered here, so its
+            // preview couldn't render. One line, so fixed in passing.
+            .environmentObject(AppRouter())
     }
 }
 #endif

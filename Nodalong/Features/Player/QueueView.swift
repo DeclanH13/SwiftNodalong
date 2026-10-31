@@ -22,6 +22,8 @@ struct QueueView: View {
             }
             .navigationTitle("Queue")
             .navigationBarTitleDisplayMode(.inline)
+            // Let the mesh show through the bar instead of the opaque app-wide nav fill.
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if !playerVM.upNext.isEmpty {
@@ -43,7 +45,16 @@ struct QueueView: View {
                     QueueRow(song: current.song, isCurrent: true)
                         .listRowBackground(Color.nodalong.bgCard)
                 } header: {
-                    sectionHeader("Now Playing")
+                    // Queue position lives here rather than on Home. The
+                    // "Continue Listening" hero that used to carry it was
+                    // redundant in every state it appeared: it showed only
+                    // while paused, and the mini player is on screen then too
+                    // — `restoreQueue()` populates `nowPlaying`, so even a
+                    // cold launch had both showing the same track. This is
+                    // where someone actually looks for their place in a queue.
+                    sectionHeader(playerVM.queue.count > 1
+                        ? "Now Playing · \(playerVM.currentIndex + 1) of \(playerVM.queue.count)"
+                        : "Now Playing")
                 }
             }
 
@@ -54,7 +65,11 @@ struct QueueView: View {
                         .foregroundStyle(Color.nodalong.textSecondary)
                         .listRowBackground(Color.clear)
                 } else {
-                    ForEach(playerVM.upNext) { item in
+                    // One snapshot for the rows AND the edit callbacks, so a drop or
+                    // delete is translated to ids against exactly the list the user
+                    // was looking at — not against a queue that advanced since.
+                    let up = playerVM.upNext
+                    ForEach(up) { item in
                         Button {
                             Task { await playerVM.playQueueItem(item) }
                         } label: {
@@ -63,11 +78,27 @@ struct QueueView: View {
                         .buttonStyle(.plain)
                         .listRowBackground(Color.nodalong.bgCard)
                     }
-                    .onMove(perform: playerVM.moveUpNext)
-                    .onDelete(perform: playerVM.removeUpNext)
+                    .onMove { source, destination in
+                        playerVM.moveUpNext(ids: source.sorted().map { up[$0].id },
+                                            before: destination < up.count ? up[destination].id : nil)
+                    }
+                    .onDelete { offsets in
+                        playerVM.removeUpNext(ids: Set(offsets.map { up[$0].id }))
+                    }
                 }
             } header: {
-                sectionHeader("Up Next")
+                // "Clear" sits opposite the title. No confirmation, by
+                // request — and the playing track is never removed.
+                HStack {
+                    sectionHeader("Up Next")
+                    Spacer()
+                    if !playerVM.upNext.isEmpty {
+                        Button("Clear") { playerVM.clearUpNext() }
+                            .font(Font.nodalong.footnoteSemibold)
+                            .foregroundStyle(Color.nodalong.purpleAccent)
+                            .textCase(nil)
+                    }
+                }
             }
         }
         .listStyle(.insetGrouped)
@@ -82,8 +113,9 @@ struct QueueView: View {
 }
 
 /// A single queue row — artwork, title/artist, and a speaker glyph on the
-/// currently-playing entry.
-private struct QueueRow: View {
+/// currently-playing entry. Internal (not private) so the LP setup sheet can
+/// show the same rows rather than a second copy of them.
+struct QueueRow: View {
     let song: Song
     let isCurrent: Bool
 

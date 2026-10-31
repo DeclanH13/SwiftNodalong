@@ -43,7 +43,7 @@ struct NearMeUserSheet: View {
 
     @State private var following     = false
     @State private var followLoading = false
-    @State private var recentTracks: [Post] = []
+    @State private var recentTracks: [Post]
     /// The passed-in `user.spotlightTracks` are slim event entries; enriched
     /// with catalog metadata in `loadData`.
     @State private var spotlights: [SpotlightTrack] = []
@@ -58,6 +58,19 @@ struct NearMeUserSheet: View {
     /// Whether `user` is currently hosting a live party (host-only scope —
     /// see plan). One-shot load alongside follow state / recents.
     @State private var hostedParty: ListeningParty?
+
+    /// NearMe already warms the people on the map (`SocialCache.prefetch`), so
+    /// seed from that synchronously: a warm sheet shows follow state and recents
+    /// on its first frame instead of popping them in.
+    init(user: UserProfile) {
+        self.user = user
+        if let b = SocialCache.peekBundle(uid: user.uid) {
+            _following    = State(initialValue: b.isFollowing)
+            _recentTracks = State(initialValue: b.recentTracks)
+        } else {
+            _recentTracks = State(initialValue: [])
+        }
+    }
 
     /// `true` when the sheet is showing the current user's own avatar — we
     /// hide the follow button in that case.
@@ -79,7 +92,7 @@ struct NearMeUserSheet: View {
             }
             .padding(.bottom, 32)
         }
-        .background(Color.nodalong.bgBase)
+        .screenBackground()
         .task { await loadData() }
         .onDisappear { presence.detachAll() }
     }
@@ -116,40 +129,11 @@ struct NearMeUserSheet: View {
         }
     }
 
-    /// "Tune In" — play the same track on this device, aligned to the other
-    /// user's position (single-song). Requires an Apple Music subscription on
-    /// BOTH sides: this device (each device streams the full track) and the
-    /// broadcaster (a preview-mode broadcaster's own playback cycles every
-    /// ~30s, which sync would just follow into a broken cycling loop).
-    @ViewBuilder
+    /// "Tune In" — see `TuneInButton` for the gating rules.
     private var tuneInControl: some View {
-        if !musicService.canPlayFullTracks {
-            Text("Apple Music subscription required to tune in")
-                .font(Font.nodalong.caption)
-                .foregroundStyle(Color.nodalong.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else if liveNowPlaying?.isPreviewPlayback == true {
-            Text("Sync unavailable — \(user.username) isn't on Apple Music")
-                .font(Font.nodalong.caption)
-                .foregroundStyle(Color.nodalong.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            Button {
-                syncCoordinator.tuneIn(uid: user.uid, label: "Tuned in to \(user.username)")
-                dismiss()
-            } label: {
-                HStack(spacing: 8) {
-                    NodalongMark(size: 18)
-                    Text("Tune In").font(Font.nodalong.subheadlineSemibold)
-                    Spacer()
-                }
-                .foregroundStyle(Color.nodalong.textOnAccent)
-                .padding(.horizontal, 14).padding(.vertical, 9)
-                .background(Color.nodalong.purpleAccent)
-                .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
-            }
-            .buttonStyle(.plain)
-        }
+        TuneInButton(uid: user.uid, username: user.username,
+                     isPreviewPlayback: liveNowPlaying?.isPreviewPlayback == true,
+                     onTuned: { dismiss() })
     }
 
     /// Mirrors `FeedView.partyBannerButton`'s styling — same affordance, same
@@ -371,12 +355,13 @@ struct NearMeUserSheet: View {
 
     private func loadData() async {
         guard let myUid = authVM.currentUser?.uid else { return }
-        async let followCheck = isFollowing(myUid: myUid, targetUid: user.uid)
-        async let recents     = getYourMusicFeed(uid: user.uid)
-        async let party       = getLivePartyHostedBy(uid: user.uid)
-        following    = (try? await followCheck) ?? false
-        recentTracks = (try? await recents)     ?? []
-        hostedParty  = (try? await party)       ?? nil
+        async let party = getLivePartyHostedBy(uid: user.uid)
+        // Through the shared cache: joins the prefetch NearMe already started
+        // (or serves it instantly) instead of re-running the same queries.
+        let bundle = await SocialCache.shared.bundle(uid: user.uid, viewerUid: myUid)
+        if following != bundle.isFollowing { following = bundle.isFollowing }
+        if recentTracks != bundle.recentTracks { recentTracks = bundle.recentTracks }
+        hostedParty  = (try? await party) ?? nil
         spotlights   = await enrichSpotlights(user.spotlightTracks)
 
         presence.observeNowPlaying(uid: user.uid) { np in

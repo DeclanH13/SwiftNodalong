@@ -22,12 +22,21 @@ struct ResolvingArtistView: View {
     @State private var resolved: ArtistResult?
     @State private var notFound = false
 
+    /// See `ResolvingAlbumView.init` — a cache hit at push time skips the
+    /// placeholder entirely.
+    init(name: String, cached: ArtistResult? = nil, resolve: @escaping () async -> ArtistResult?) {
+        self.name = name
+        self.resolve = resolve
+        _resolved = State(initialValue: cached)
+    }
+
     var body: some View {
         Group {
             if let resolved {
                 ArtistDetailSearchView(artist: resolved)
                     .transition(.opacity)
             } else {
+                ZStack(alignment: .topLeading) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         placeholderHero
@@ -40,14 +49,19 @@ struct ResolvingArtistView: View {
                     }
                 }
                 .ignoresSafeArea(edges: .top)
-                .background(Color.nodalong.bgBase)
-                .navigationTitle(name)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbarBackground(.hidden, for: .navigationBar)
+
+                }
+                .screenBackground()
+                // Floating, matching `ArtistDetailSearchView` — this
+                // placeholder deliberately mirrors that screen so the
+                // resolve→loaded swap doesn't jump, which means matching how
+                // its controls are positioned too.
+                .screenControls()
                 .transition(.opacity)
             }
         }
         .animation(.easeOut(duration: 0.25), value: resolved != nil)
+        .toolbar(.hidden, for: .navigationBar)
         .task {
             guard resolved == nil, !notFound else { return }
             if let result = await resolve() {

@@ -1,4 +1,5 @@
 import Foundation
+import FirebaseAuth
 import NodalongKit
 
 /// Mirrors the user's saved Nodalong library in memory.
@@ -13,7 +14,23 @@ import NodalongKit
 @MainActor
 final class LibraryViewModel: ObservableObject {
     @Published private(set) var tracks:    [LibraryTrackDoc] = [] {
-        didSet { recomputeDerived() }
+        didSet { PublishCounter.bump("library.tracks"); recomputeDerived() }
+    }
+
+    /// Restores last session's fully-enriched library synchronously, so Shelf
+    /// (and Home's "Recently Added") render real content on the first frame
+    /// instead of a spinner and then blank-metadata rows until enrichment lands
+    /// (~2s cold). `load` still runs and replaces it. `Auth.auth().currentUser`
+    /// is restored from the keychain synchronously, so the uid is known here.
+    init() {
+        guard ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] != "1",
+              let uid = Auth.auth().currentUser?.uid,
+              let saved = SnapshotStore.load([LibraryTrackDoc].self, key: "library", uid: uid),
+              !saved.isEmpty else { return }
+        tracks     = saved      // `didSet` does not run in init — derive explicitly below
+        catalogIds = Set(saved.map(\.catalogId))
+        uris       = Set(saved.map(\.uri).filter { !$0.isEmpty })
+        recomputeDerived()
     }
 
     // MARK: - Derived views of the library
@@ -41,21 +58,56 @@ final class LibraryViewModel: ObservableObject {
     /// Flat song list, most-recently-saved first — backs Shelf's "Liked".
     @Published private(set) var recentlyLiked: [LibraryTrackDoc] = []
 
-    /// The 10 most-recently-added albums — backs Home's "Recently Added".
-    /// Sorted by each group's newest `savedAt`, computed with a single pass
-    /// per group; the previous version recomputed `.map(\.savedAt).max()`
-    /// (two array allocations) on both sides of every sort comparison.
+    /// Every album group, newest save first — backs Home's "Recently Added"
+    /// see-all screen. Sorted by each group's newest `savedAt`, computed with
+    /// a single pass per group; the previous version recomputed
+    /// `.map(\.savedAt).max()` (two array allocations) on both sides of every
+    /// sort comparison.
+    @Published private(set) var albumGroupsByRecency: [AlbumGroup] = []
+
+    /// The 10 most-recently-added albums — backs Home's "Recently Added" rail.
+    /// A prefix of `albumGroupsByRecency`, so the sort happens once: the
+    /// see-all screen previously re-derived the identical ordering in a view
+    /// body, over every album group, on every render.
     @Published private(set) var recentAlbumGroups: [AlbumGroup] = []
+
+    /// The library bucketed by genre — backs Shelf's Genres grid. Same
+    /// once-per-change rule as the others: `groupByGenre` normalises artist
+    /// strings per track, so it must never run from a view body.
+    @Published private(set) var genreEntries: [GenreEntry] = []
+
+    /// Genres that genuinely describe the library (an artist counts only when
+    /// enough of their tracks carry the tag) — what discovery tiles are offered
+    /// for, so one mislabelled single can't earn a genre a tile. Same
+    /// once-per-change rule as the others.
+    @Published private(set) var discoverableGenreEntries: [GenreEntry] = []
+
+    /// 0...1 listening weights for ranking search results: per artist
+    /// (square-rooted so a huge catalogue doesn't drown everyone else) and per
+    /// genre. Built in the same once-per-change pass as the rest.
+    @Published private(set) var tasteWeights = TasteWeights.empty
 
     private func recomputeDerived() {
         albumGroups   = groupByAlbum(tracks)
         artistEntries = groupByArtist(tracks)
+        genreEntries  = groupByGenre(tracks)
+        discoverableGenreEntries = discoverableGenres(tracks)
+        var artistWeights: [String: Double] = [:]
+        let maxArtist = Double(artistEntries.map(\.trackCount).max() ?? 1)
+        for entry in artistEntries {
+            let key = primaryArtist(entry.name).lowercased()
+            artistWeights[key] = Swift.max(artistWeights[key] ?? 0, (Double(entry.trackCount) / maxArtist).squareRoot())
+        }
+        let maxGenre = Double(genreEntries.map(\.trackCount).max() ?? 1)
+        var genreWeights: [String: Double] = [:]
+        for entry in genreEntries { genreWeights[entry.name.lowercased()] = Double(entry.trackCount) / maxGenre }
+        tasteWeights = TasteWeights(artists: artistWeights, genres: genreWeights)
         recentlyLiked = tracks.sorted { $0.savedAt > $1.savedAt }
-        recentAlbumGroups = albumGroups
+        albumGroupsByRecency = albumGroups
             .map { (group: $0, savedAt: $0.tracks.reduce(0.0) { Swift.max($0, $1.savedAt) }) }
             .sorted { $0.savedAt > $1.savedAt }
-            .prefix(10)
             .map(\.group)
+        recentAlbumGroups = Array(albumGroupsByRecency.prefix(10))
     }
 
     @Published private(set) var catalogIds: Set<String>      = []
@@ -103,6 +155,7 @@ final class LibraryViewModel: ObservableObject {
             guard let self, self.loadedForUid == uid else { return }
             self.tracks = enriched
             self.uris   = Set(enriched.map { $0.uri }.filter { !$0.isEmpty })
+            SnapshotStore.save(enriched, key: "library", uid: uid)
             diagLog("LibraryViewModel.load: PHASE 2 enrich in \(Int(Date().timeIntervalSince(enrichStart) * 1000))ms")
         }
     }
@@ -208,11 +261,54 @@ final class LibraryViewModel: ObservableObject {
                     isrc:              t.isrc,
                     trackNumber:       t.trackNumber,
                     albumReleaseDate:  t.albumReleaseDate,
+                    isExplicit:        t.isExplicit,
                     appleMusicUri:     t.uri,
                     appleMusicTrackId: t.uri
                 ))
             }
         }
+    }
+
+    /// Replaces Apple's pre-release "Track N" placeholder titles on saved tracks
+    /// with real titles taken from a live album track list the caller already
+    /// has (Apple's own album listing is always current).
+    ///
+    /// Matches by ISRC, falling back to track number. Writes each fix to the
+    /// shared catalog row (so Feed, Spotlight and other users heal too), then
+    /// re-joins the catalog so this screen updates without a relaunch. A no-op
+    /// — no network at all — unless a saved track really has a placeholder.
+    func healStaleTracks(from real: [NodalongKit.Song]) async {
+        // Stale = still carrying Apple's pre-release placeholder, or missing a
+        // duration (the metadata a released track always has).
+        let stale = tracks.filter { isPlaceholderTrackTitle($0.title) || ($0.duration ?? 0) == 0 }
+        guard !stale.isEmpty else { return }
+
+        var fixes: [(LibraryTrackDoc, NodalongKit.Song)] = []
+        for doc in stale {
+            let match = real.first { r in
+                if let a = doc.isrc, !a.isEmpty, let b = r.isrc, !b.isEmpty { return a == b }
+                return false
+            } ?? real.first { r in
+                doc.trackNumber != nil && r.trackNumber == doc.trackNumber
+            }
+            if let match, !isPlaceholderTrackTitle(match.title), !match.title.isEmpty,
+               isPlaceholderTrackTitle(doc.title) || (match.duration ?? 0) > 0 {
+                fixes.append((doc, match))
+            }
+        }
+        guard !fixes.isEmpty else { return }
+
+        for (doc, r) in fixes {
+            _ = try? await upsertCatalogTrack(CatalogTrackInput(
+                title: r.title, artist: doc.artist, album: doc.album, artwork: doc.artwork,
+                duration: r.duration, isrc: doc.isrc ?? r.isrc, trackNumber: doc.trackNumber,
+                albumReleaseDate: r.albumReleaseDate ?? doc.albumReleaseDate,
+                appleMusicUri: doc.uri, appleMusicTrackId: doc.uri
+            ))
+        }
+        await CatalogCache.shared.invalidate(fixes.map { $0.0.catalogId })
+        let healed = await enrichLibrary(tracks)
+        tracks = healed
     }
 
     /// Removes an album's tracks from the library.

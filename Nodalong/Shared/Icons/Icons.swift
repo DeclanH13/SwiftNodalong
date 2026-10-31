@@ -28,6 +28,7 @@ enum Icons {
     static let play               = "play.fill"
     static let queue              = "list.bullet"
     static let addToQueue         = "text.badge.plus"
+    static let playNext           = "text.line.first.and.arrowtriangle.forward"
     static let search             = "magnifyingglass"
     static let searchOutline      = "magnifyingglass"
     static let settingsOutline    = "gearshape"

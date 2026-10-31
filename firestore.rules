@@ -52,6 +52,20 @@ service cloud.firestore {
 
       // Owner manages their own "following"; a "followers/{followerId}" entry is
       // writable only by that follower (the follow op writes into the target).
+      // Inbox: songs and playlist invites FROM mutual follows. Only the
+      // recipient reads/deletes; senders create (never edit) and only when the
+      // two users follow each other, with a fixed key set and a capped note.
+      match /inbox/{eventId} {
+        allow read, delete: if signedIn() && uid() == userId;
+        allow create: if signedIn()
+          && request.resource.data.fromUid == uid()
+          && request.resource.data.keys().hasOnly(['type','fromUid','fromUsername','fromAvatarEmoji','fromAvatarColor','catalogId','playlistId','playlistTitle','note','createdAt'])
+          && (!('note' in request.resource.data) || request.resource.data.note.size() <= 140)
+          && exists(/databases/$(database)/documents/users/$(userId)/following/$(uid()))
+          && exists(/databases/$(database)/documents/users/$(uid())/following/$(userId));
+        allow update: if false;
+      }
+
       match /following/{followedId} { allow read: if signedIn(); allow write: if signedIn() && uid() == userId; }
       match /followers/{followerId} { allow read: if signedIn(); allow write: if signedIn() && uid() == followerId; }
     }
@@ -59,14 +73,52 @@ service cloud.firestore {
     // Playlists — only the owner mutates; owner also owns the tracks subcollection
     // (add-to-playlist always targets one of the caller's own playlists; the
     // party-freeze writes as the host, who owns the result playlist).
+    // A playlist doc is readable when the viewer owns it, contributed to it, it
+    // is public, or it is friends-only and the viewer follows the owner.
+    //
+    // IMPORTANT: Firestore evaluates read rules PER RETURNED DOCUMENT on a list
+    // query, and if any one document fails the WHOLE query fails rather than
+    // filtering that document out. So a client query must be shaped so every
+    // document it can return independently satisfies this rule:
+    //   • your own playlists  -> query contributorUids arrayContains yourUid
+    //   • someone else's      -> query ownerUid == them AND visibility in [...]
+    // Querying someone else's by contributorUids returns docs that do NOT list
+    // you, which fails this rule and kills the query. That is exactly why an
+    // earlier attempt at visibility rules was reverted — see the decisions log.
+    function canReadPlaylist(data) {
+      return uid() == data.ownerUid
+        || uid() in data.contributorUids
+        || data.visibility == 'public'
+        || (data.visibility == 'friends'
+            && exists(/databases/$(database)/documents/users/$(data.ownerUid)/followers/$(uid())));
+    }
+
     match /playlists/{playlistId} {
-      allow read:          if signedIn();
+      allow read:          if signedIn() && canReadPlaylist(resource.data);
       allow create:        if signedIn() && uid() == request.resource.data.ownerUid;
-      allow update, delete: if signedIn() && uid() == resource.data.ownerUid;
+      allow delete: if signedIn() && uid() == resource.data.ownerUid;
+      // Owner edits anything. A contributor may only bump the counters/cover that
+      // adding a track touches. An invitee may add THEMSELVES (exactly one new
+      // uid) — and only while the sender's invite doc exists in their inbox.
+      allow update: if signedIn() && (
+        uid() == resource.data.ownerUid
+        || (uid() in resource.data.contributorUids
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['trackCount','updatedAt','coverArtwork']))
+        || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['contributorUids'])
+            && request.resource.data.contributorUids.hasAll(resource.data.contributorUids)
+            && request.resource.data.contributorUids.size() == resource.data.contributorUids.size() + 1
+            && uid() in request.resource.data.contributorUids
+            && exists(/databases/$(database)/documents/users/$(uid())/inbox/$('invite_' + playlistId)))
+      );
 
       match /tracks/{trackId} {
-        allow read:  if signedIn();
-        allow write: if signedIn() && uid() == playlist(playlistId).ownerUid;
+        // Track visibility follows the parent playlist's.
+        allow read:   if signedIn() && canReadPlaylist(playlist(playlistId));
+        // Contributors (the owner is always listed) add tracks.
+        allow create: if signedIn() && uid() in playlist(playlistId).contributorUids;
+        allow update: if signedIn() && uid() == playlist(playlistId).ownerUid;
+        // Owner removes anything; a contributor removes only what they added.
+        allow delete: if signedIn() && (uid() == playlist(playlistId).ownerUid || uid() == resource.data.addedByUid);
       }
     }
 

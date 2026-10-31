@@ -3,11 +3,11 @@ import NodalongKit
 
 /// Paged vertical-stack carousel of a user's recent tracks.
 ///
-/// Used by both `ProfileView` (own recents — full callback set) and
-/// `UserProfileView` (other user's recents — read-only-ish, no spotlight
-/// affordance). Chunks the input post list into pages of `pageSize`
-/// (default 10), renders each page as a vertical stack of `TrackCard`s, and
-/// lets the user swipe horizontally between pages.
+/// Used by both `ProfileView` (own recents) and `UserProfileView` (another
+/// user's recents — identical otherwise; spotlighting works the same either
+/// way, via each row's own "…" menu). Chunks the input post list into pages
+/// of `pageSize` (default 10), renders each page as a vertical stack of
+/// `TrackCard`s, and lets the user swipe horizontally between pages.
 ///
 /// Page-indicator dots sit beneath the cards. Page count is derived from
 /// `posts.count / pageSize`.
@@ -16,9 +16,6 @@ struct RecentTracksCarousel: View {
     let isSpotlit:    (Post) -> Bool
     let isLiked:      (Post) -> Bool
     let onPlay:       (Post) -> Void
-    /// `nil` disables the spotlight button entirely — set this when viewing
-    /// someone else's profile (you can't spotlight on their behalf).
-    let onSpotlight:  ((Post) -> Void)?
     let onLike:       (Post) -> Void
     /// Optional "Add to Queue" action, offered via each card's "..." button
     /// (`TrackActionsMenuButton`). When `nil`, cards show no queue action.
@@ -46,7 +43,6 @@ struct RecentTracksCarousel: View {
          isSpotlit: @escaping (Post) -> Bool,
          isLiked: @escaping (Post) -> Bool,
          onPlay: @escaping (Post) -> Void,
-         onSpotlight: ((Post) -> Void)?,
          onLike: @escaping (Post) -> Void,
          onAddToQueue: ((Post) -> Void)? = nil,
          pageSize: Int = 6) {
@@ -54,7 +50,6 @@ struct RecentTracksCarousel: View {
         self.isSpotlit = isSpotlit
         self.isLiked = isLiked
         self.onPlay = onPlay
-        self.onSpotlight = onSpotlight
         self.onLike = onLike
         self.onAddToQueue = onAddToQueue
         self.pageSize = pageSize
@@ -110,13 +105,11 @@ struct RecentTracksCarousel: View {
                             VStack(spacing: 6) {
                                 ForEach(pagePosts) { post in
                                     // `layout: .row` — matches Feed's
-                                    // TrackCard. `onSpotlight`, when
-                                    // non-nil (own profile), routes into the
-                                    // "..." menu automatically (same as
-                                    // `SpotlightCarousel`) rather than a 4th
-                                    // standalone icon — `.row`'s icon column
-                                    // is capped at 3 by its 44pt-per-icon
-                                    // tap-target minimum, see
+                                    // TrackCard. Spotlighting goes through
+                                    // the "…" menu (`addToPlaylistSong`),
+                                    // not a standalone icon — `.row`'s icon
+                                    // column is capped at 3 by its
+                                    // 44pt-per-icon tap-target minimum, see
                                     // `TrackCard.rowHeight`'s doc comment.
                                     TrackCard(
                                         title:        post.title,
@@ -127,7 +120,6 @@ struct RecentTracksCarousel: View {
                                         nods:         post.nods,
                                         isSpotlit:    isSpotlit(post),
                                         onPlay:       { onPlay(post) },
-                                        onSpotlight:  onSpotlight.map { fn in { fn(post) } },
                                         onToggleLike: { onLike(post) },
                                         isLiked:      isLiked(post),
                                         onAddToQueue: onAddToQueue.map { fn in { fn(post) } },
@@ -135,9 +127,7 @@ struct RecentTracksCarousel: View {
                                     )
                                 }
                             }
-                            .padding(6)
-                            .background(Color.nodalong.bgBase)
-                            .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+                            .trackListContainer()
                             Spacer(minLength: 0)
                         }
                         .tag(idx)
@@ -147,6 +137,8 @@ struct RecentTracksCarousel: View {
                 // .id resets the paging scroll position when the page count
                 // changes (e.g. recents finish loading).
                 .id(pages.count)
+                // Starts with its pages when Profile paints from cache — see `RemountOnAppear`.
+                .remountOnAppear()
                 .tabViewStyle(.page(indexDisplayMode: .never))
                 .frame(height: maxPageHeight + 12)
                 .frame(height: displayedHeight + 12, alignment: .top)
@@ -213,30 +205,13 @@ struct RecentTracksCarousel: View {
 }
 
 #if DEBUG
-#Preview("Carousel – own profile (spotlight + like)") {
-    ScrollView {
-        RecentTracksCarousel(
-            posts:       PreviewFixtures.posts,
-            isSpotlit:   { _ in false },
-            isLiked:     { _ in false },
-            onPlay:      { _ in },
-            onSpotlight: { _ in },
-            onLike:      { _ in }
-        )
-        .padding(.horizontal, 16)
-    }
-    .background(Color.nodalong.bgBase)
-    .withPreviewEnvironment()
-}
-
-#Preview("Carousel – other user (read-only)") {
+#Preview("Carousel") {
     ScrollView {
         RecentTracksCarousel(
             posts:       PreviewFixtures.posts,
             isSpotlit:   { _ in true },
             isLiked:     { _ in false },
             onPlay:      { _ in },
-            onSpotlight: nil,    // nil hides the spotlight button
             onLike:      { _ in }
         )
         .padding(.horizontal, 16)

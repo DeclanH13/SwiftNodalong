@@ -10,7 +10,8 @@ final class GroupPostsByAlbumTests: XCTestCase {
         album: String,
         artwork: String = "artwork.jpg",
         createdAt: Double,
-        replayCount: Int = 0
+        replayCount: Int = 0,
+        isExplicit: Bool = false
     ) -> Post {
         Post(
             id: "u_\(catalogId)",
@@ -24,6 +25,7 @@ final class GroupPostsByAlbumTests: XCTestCase {
             uri: catalogId,
             sourceService: .appleMusic,
             replayCount: replayCount,
+            isExplicit: isExplicit,
             createdAt: createdAt
         )
     }
@@ -136,5 +138,27 @@ final class GroupPostsByAlbumTests: XCTestCase {
 
         XCTAssertEqual(albums.count, 1)
         XCTAssertEqual(albums.first?.artistName, variousArtistsLabel)
+    }
+
+    // MARK: - Album-level explicit
+
+    // Same any-track rule as `AlbumGroup.isExplicit`, for the feed-derived
+    // rails on Home.
+    func testRecentAlbumIsExplicitWhenAnyPostIs() {
+        let albums = recentAlbums(from: [
+            post(catalogId: "1", title: "A", artist: "X", album: "LP", createdAt: 2),
+            post(catalogId: "2", title: "B", artist: "X", album: "LP", createdAt: 1, isExplicit: true),
+        ])
+        XCTAssertEqual(albums.count, 1)
+        XCTAssertTrue(albums[0].isExplicit)
+    }
+
+    func testRecentAlbumIsNotExplicitWhenNoPostIs() {
+        let albums = recentAlbums(from: [
+            post(catalogId: "1", title: "A", artist: "X", album: "LP", createdAt: 2),
+            post(catalogId: "2", title: "B", artist: "X", album: "LP", createdAt: 1),
+        ])
+        XCTAssertEqual(albums.count, 1)
+        XCTAssertFalse(albums[0].isExplicit)
     }
 }

@@ -15,7 +15,7 @@ struct QueueToastOverlay: View {
     @EnvironmentObject private var playerVM: PlayerViewModel
     @EnvironmentObject private var partyVM:  ListeningPartyViewModel
 
-    /// `true` while any keyboard is on screen (e.g. Shelf's `.searchable`
+    /// `true` while any keyboard is on screen (e.g. Shelf's filter field
     /// filter focused). Drives the background fill below — without it, the
     /// region behind/around the keyboard shows the raw black UIKit layer
     /// instead of the app's background, regardless of whether a toast is

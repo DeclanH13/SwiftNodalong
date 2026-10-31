@@ -23,6 +23,10 @@ struct FeedView: View {
 
     /// Live parties hosted by people this user follows (party discovery).
     @State private var liveParties: [ListeningParty] = []
+    @State private var liveListeners: [LiveNowEntry] = []
+    /// Driven by a re-tap of the Feed tab while already at the root.
+    @State private var scrollPosition = ScrollPosition(edge: .top)
+    /// Whether the tab-root header is currently scrolled away.
 
     var body: some View {
         // `@Bindable` is required to derive a `$` binding from an
@@ -30,6 +34,7 @@ struct FeedView: View {
         @Bindable var authVM = authVM
 
         NavigationStack(path: $router.feedPath) {
+            VStack(spacing: 0) {
             Group {
                 // The `!hasLoaded` clause covers the brief window on first
                 // appearance before `.task` has run at all (isLoading is
@@ -44,23 +49,32 @@ struct FeedView: View {
                     emptyState
                 } else {
                     ScrollView {
-                        // Container merges into the page (bgBase) — mirrors
-                        // Recent Tracks / Spotlight's container treatment.
-                        // The individual TrackCard rows (bgCard) are what
-                        // lift off the page now, not this wrapper. Still a
-                        // LazyVStack inside — the background/clipShape size
-                        // to its full logical content height, so lazy card
-                        // instantiation is unaffected.
-                        LazyVStack(spacing: 12) {
-                            ForEach(feedVM.posts) { post in
-                                feedCard(post)
+                        VStack(spacing: 0) {
+                            // The profile avatar — genuine first-row content,
+                            // not a floating overlay, so it scrolls away with
+                            // the rest of the feed and returns at the top.
+                            ProfileAvatarRow()
+
+                            // Container merges into the page (bgBase) — mirrors
+                            // Recent Tracks / Spotlight's container treatment.
+                            // The individual TrackCard rows (bgCard) are what
+                            // lift off the page now, not this wrapper. Still a
+                            // LazyVStack inside — the background/clipShape size
+                            // to its full logical content height, so lazy card
+                            // instantiation is unaffected.
+                            LazyVStack(spacing: 12) {
+                                ForEach(feedVM.posts) { post in
+                                    feedCard(post)
+                                }
                             }
+                            .trackListContainer()
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
                         }
-                        .padding(6)
-                        .background(Color.nodalong.bgBase)
-                        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 6)
+                    }
+                    .scrollPosition($scrollPosition)
+                    .onChange(of: router.scrollToTopRequests[.feed]) {
+                        withAnimation(.easeInOut(duration: 0.3)) { scrollPosition.scrollTo(edge: .top) }
                     }
                     .refreshable {
                         await feedVM.refresh(myUid: authVM.currentUser?.uid)
@@ -73,27 +87,24 @@ struct FeedView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .top) { partyBanner }
-            .background(Color.nodalong.bgBase)
-            .navigationTitle("Feed")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                // Starting a party moved to the mini player's broadcast
-                // button (see `MiniPlayerBar`'s own doc comment) — it's
-                // reachable from every tab there, not just Feed, and
-                // anchored to "what's currently playing" rather than a nav
-                // bar disconnected from playback state. `partyBanner` above
-                // (discovery — "return to your party" / "X is hosting")
-                // stays unchanged.
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        Task { await feedVM.refresh(myUid: authVM.currentUser?.uid) }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .foregroundStyle(Color.nodalong.purpleAccent)
-                    }
-                }
+            .safeAreaInset(edge: .top) {
+                VStack(spacing: 0) { partyBanner; listeningStrip }
             }
+            }
+            // Hoisted off `ScreenHeader` so the pop-gesture install survives
+            // the header being collapsed away — see `SwipeBackGesture.swift`.
+            .enablesInteractiveSwipeBack()
+            // Warm the people whose cards are on screen — the username chip on
+            // each card opens their profile. `prefetch` caps at 6 (each bundle
+            // is ~5 billed reads) and skips the viewer.
+            .task(id: feedVM.posts.prefix(8).map(\.uid)) {
+                guard let me = authVM.currentUser?.uid else { return }
+                var seen = Set<String>()
+                let uids = feedVM.posts.prefix(8).map(\.uid).filter { seen.insert($0).inserted }
+                SocialCache.shared.prefetch(uids: uids, viewerUid: me)
+            }
+            .screenBackground()
+            .toolbar(.hidden, for: .navigationBar)
             // Both destinations a follow-list flow needs, registered together on
             // every stack that can host it.
             //
@@ -124,16 +135,22 @@ struct FeedView: View {
             // whichever tab happens to be selected, and Feed previously had
             // none of the registrations above at all.
             .navigationDestination(for: PendingArtistResolve.self) { pending in
-                ResolvingArtistsView(name: pending.artist) {
+                ResolvingArtistsView(name: pending.artist, cached: cachedPendingArtists(pending, playerVM: playerVM)) {
                     await resolvePendingArtists(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .navigationDestination(for: PendingAlbumResolve.self) { pending in
-                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork) {
+                ResolvingAlbumView(name: pending.albumName, artistName: pending.artist, artwork: pending.artwork,
+                                   cached: cachedPendingAlbum(pending, playerVM: playerVM)) {
                     await resolvePendingAlbum(for: pending, playerVM: playerVM, musicService: musicService, activeService: activeService)
                 }
             }
             .profileEntryPoint()
+            // `.enablesInteractiveSwipeBack()` only — the profile avatar
+            // itself now lives as the first row of the loaded feed's own
+            // ScrollView, not floating over it. `showsBack: false` — a tab
+            // root has nothing to pop to.
+            .screenControls(showsBack: false)
         }
         .alert("Daily Limit Reached", isPresented: $authVM.spotlightLimitReached) {
             Button("OK", role: .cancel) {}
@@ -179,6 +196,30 @@ struct FeedView: View {
         }
     }
 
+    /// Followed people playing right now, each with a Tune In button.
+    @ViewBuilder
+    private var listeningStrip: some View {
+        if !liveListeners.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 14) {
+                    ForEach(liveListeners) { entry in
+                        VStack(spacing: 4) {
+                            AvatarView(emoji: entry.avatarEmoji, colorHex: entry.avatarColor, size: 40)
+                            Text(entry.username).font(Font.nodalong.caption2)
+                                .foregroundStyle(Color.nodalong.textSecondary).lineLimit(1)
+                                .frame(width: 60)
+                            if case .listening(_, let isPreview) = entry.kind {
+                                TuneInButton(uid: entry.uid, username: entry.username,
+                                             isPreviewPlayback: isPreview, compact: true)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 16).padding(.vertical, 8)
+            }
+        }
+    }
+
     private func partyBannerButton(text: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
@@ -200,6 +241,8 @@ struct FeedView: View {
         // at launch; the cache collapses the duplicate reads.
         let following = await FollowingCache.shared.following(uid: uid).map(\.uid)
         liveParties = await FollowingCache.shared.liveParties(hostedBy: following)
+        liveListeners = await LiveListenersLoader.load(
+            followingUids: following, excluding: Set(liveParties.map(\.hostUid)))
     }
 
     @ViewBuilder
@@ -228,8 +271,8 @@ struct FeedView: View {
     /// Fetches the full `UserProfile` for `uid` and pushes `UserProfileView`
     /// — `TrackCard`'s attribution chip only knows a uid, not a profile.
     private func openProfile(_ uid: String) async {
-        guard let profile = try? await getUserProfile(uid: uid) else { return }
-        router.feedPath.append(profile)
+        guard let profile = await profileForNavigation(uid: uid, viewerUid: authVM.currentUser?.uid) else { return }
+        router.push(profile, onto: .feed)
     }
 
     private func playPost(_ post: Post) {
@@ -262,9 +305,7 @@ struct FeedView: View {
                         .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
                 }
             }
-            .padding(6)
-            .background(Color.nodalong.bgBase)
-            .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+            .trackListContainer()
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
         }

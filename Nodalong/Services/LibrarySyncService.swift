@@ -171,6 +171,8 @@ final class LibrarySyncService: ObservableObject {
                 isrc:              song.isrc,
                 trackNumber:       song.trackNumber,
                 albumReleaseDate:  song.albumReleaseDate,
+                genres:            song.genres,
+                isExplicit:        song.isExplicit,
                 appleMusicUri:     song.uri,
                 appleMusicTrackId: song.trackId
             )
@@ -235,6 +237,8 @@ final class LibrarySyncService: ObservableObject {
                 isrc:             song.isrc,
                 trackNumber:      song.trackNumber,
                 albumReleaseDate: song.albumReleaseDate,
+                genres:           song.genres,
+                isExplicit:       song.isExplicit,
                 spotifyUri:       song.uri,
                 spotifyTrackId:   song.trackId
             )

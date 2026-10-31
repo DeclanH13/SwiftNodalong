@@ -62,6 +62,17 @@ struct VinylArtworkView: View {
     /// pattern `SpinWhilePlaying` already proved safe, so it costs nothing
     /// while backgrounded.
     var flipsOnTap: Bool = false
+    /// Adds a small stand beneath the disc — two prongs flanking its
+    /// lower sides plus a base bar that sinks slightly behind the disc's
+    /// own bottom edge, so it reads as slotted into a rack rather than
+    /// resting on a flat shelf. Opt-in, scoped to contexts where the user
+    /// is browsing a LIST of albums to pick from (Shelf's Albums grid,
+    /// Home's "See All" grids) — never rail carousels, an artist's
+    /// discography, or a single-album hero. Renders as a static overlay
+    /// outside the `TimelineView` that drives `flipsOnTap`'s rocking/flip
+    /// motion — no call site sets both, the same mutual-exclusivity as
+    /// `isAlbum`/`isTrack` on `ArtworkThumbnail`.
+    var onStand: Bool = false
 
     /// Cumulative rotation in degrees. Grows by a full 360 per completed
     /// flip (not reset to 0 mid-gesture) so the animation always continues
@@ -71,11 +82,12 @@ struct VinylArtworkView: View {
     @State private var isFlipping = false
     @Environment(\.scenePhase) private var scenePhase
 
-    init(url: String, size: CGFloat, showsGrooves: Bool = true, flipsOnTap: Bool = false) {
+    init(url: String, size: CGFloat, showsGrooves: Bool = true, flipsOnTap: Bool = false, onStand: Bool = false) {
         self.url = url
         self.size = size
         self.showsGrooves = showsGrooves
         self.flipsOnTap = flipsOnTap
+        self.onStand = onStand
     }
 
     var body: some View {
@@ -100,11 +112,77 @@ struct VinylArtworkView: View {
                 animatedDisc
             }
         }
+        .overlay(alignment: .bottom) {
+            if onStand {
+                standOverlay
+            }
+        }
     }
 
+    /// Two prongs + a base bar, flat painted forest green. Sized as
+    /// percentages of `size` so the stand scales with the tile regardless
+    /// of grid density. Positioned via `.overlay(alignment: .bottom)` on
+    /// the whole disc rather than nested inside `disc(...)`'s own centered
+    /// frame, so it can overlap upward into the disc's lower edge
+    /// independent of the disc's own ~6% centering margin within its box.
+    ///
+    /// The disc circle sits centered with ~6% margin on every side
+    /// (`discScale` = 0.88). The base bar spans 4%–13% from the bottom,
+    /// straddling the disc's lowest point (6%) — a small, correct
+    /// overlap. The prongs run 4%–23% from the bottom; at their top the
+    /// disc's edge curve has widened out to almost exactly the prong's
+    /// outer edge, so the prong visually laps over the disc's lower-side
+    /// curve (the "cradle" effect), while their lower portion sits
+    /// entirely below the disc, free-standing.
+    private var standOverlay: some View {
+        ZStack(alignment: .bottom) {
+            Capsule()
+                .fill(Color.black.opacity(0.28))
+                .frame(height: 5)
+                .blur(radius: 1.5)
+                .padding(.horizontal, size * 0.08)
+
+            HStack {
+                standBar.frame(width: size * 0.08, height: size * 0.19)
+                Spacer()
+                standBar.frame(width: size * 0.08, height: size * 0.19)
+            }
+            .padding(.horizontal, size * 0.15)
+
+            standBar
+                .frame(height: size * 0.09)
+                .padding(.horizontal, size * 0.13)
+        }
+        .padding(.bottom, size * 0.04)
+        .frame(width: size, height: size, alignment: .bottom)
+    }
+
+    private var standBar: some View {
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(LinearGradient(colors: [Self.standLight, Self.standDark],
+                                  startPoint: .top, endPoint: .bottom))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+    }
+
+    private static let standLight = Color(red: 0.247, green: 0.478, blue: 0.271) // flat forest green
+    private static let standDark  = Color(red: 0.141, green: 0.318, blue: 0.165)
+
+    /// The disc renders this fraction of its allotted `size`, centred — the
+    /// remainder is deliberate breathing room (see the type's doc comment).
+    /// Exposed so anything drawing ON the disc from outside — `VinylSpotlight`
+    /// aligns its lit band and its floor pool to it — derives the same
+    /// geometry rather than hardcoding a second copy that can drift.
+    static let discScale: CGFloat = 0.88
+    /// The artwork label's diameter as a fraction of the disc's.
+    static let labelScale: CGFloat = 0.44
+
     private var animatedDisc: some View {
-        let discSize = size * 0.88
-        let labelSize = discSize * 0.44
+        let discSize = size * Self.discScale
+        let labelSize = discSize * Self.labelScale
 
         // Paused (not ticking at all) whenever `flipsOnTap` is false — which
         // is every `isAlbum: true` disc app-wide EXCEPT the one opted-in

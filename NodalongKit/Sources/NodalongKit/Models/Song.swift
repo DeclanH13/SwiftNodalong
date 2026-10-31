@@ -31,12 +31,32 @@ public struct Song: Codable, Identifiable, Hashable, Sendable {
     /// `Song` is persisted directly via `SnapshotStore` (Home's cached
     /// top-charts snapshot) and an older cached file won't have this key.
     public var isExplicit: Bool
+    /// Apple Music genre names for this track (e.g. ["Alternative"]).
+    /// Empty for anything ingested before genre capture, and for tracks Apple
+    /// gives no genre for — treat empty as "unknown", never as a real bucket.
+    public var genres: [String]
+    /// False when Apple has the track in its catalog but not yet playable —
+    /// the unreleased tracks of a pre-release album, which Apple returns with
+    /// placeholder titles ("Track 1", "Track 3") and no duration.
+    ///
+    /// Read from MusicKit's `playParameters`, which is `nil` for exactly this
+    /// case — authoritative, unlike inferring it from a missing duration.
+    /// Defaults `true`: every existing caller and every stored snapshot
+    /// predates this field, and "playable" is the only safe assumption for a
+    /// track we know nothing else about.
+    public var isPlayable: Bool
+    /// This TRACK's own release date ("yyyy-MM-dd"), which is not the same
+    /// question as `albumReleaseDate`: on a pre-release album the album's date
+    /// is still in the future while an already-released lead single carries
+    /// its own, earlier one.
+    public var releaseDate: String?
 
     enum CodingKeys: String, CodingKey {
         case id, title, artist, album, artwork, liked, nods, uri
         case trackId = "track_id"
         case userName = "user_name"
-        case listenedAt, catalogId, sourceService, isrc, duration, trackNumber, albumReleaseDate, isExplicit
+        case listenedAt, catalogId, sourceService, isrc, duration, trackNumber, albumReleaseDate, isExplicit, genres
+        case isPlayable, releaseDate
     }
 
     public init(
@@ -57,7 +77,10 @@ public struct Song: Codable, Identifiable, Hashable, Sendable {
         duration: Int? = nil,
         trackNumber: Int? = nil,
         albumReleaseDate: String? = nil,
-        isExplicit: Bool = false
+        isExplicit: Bool = false,
+        genres: [String] = [],
+        isPlayable: Bool = true,
+        releaseDate: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -77,6 +100,9 @@ public struct Song: Codable, Identifiable, Hashable, Sendable {
         self.trackNumber = trackNumber
         self.albumReleaseDate = albumReleaseDate
         self.isExplicit = isExplicit
+        self.genres = genres
+        self.isPlayable = isPlayable
+        self.releaseDate = releaseDate
     }
 
     public init(from decoder: Decoder) throws {
@@ -99,6 +125,18 @@ public struct Song: Codable, Identifiable, Hashable, Sendable {
         trackNumber = try c.decodeIfPresent(Int.self, forKey: .trackNumber)
         albumReleaseDate = try c.decodeIfPresent(String.self, forKey: .albumReleaseDate)
         isExplicit = try c.decodeIfPresent(Bool.self, forKey: .isExplicit) ?? false
+        // Tolerant, like every field here: `Song` is persisted via SnapshotStore
+        // (Home's topChartSongs), and a required new key would make every
+        // existing on-disk snapshot fail to decode — silently turning each
+        // launch back into a cold network load with no signal.
+        genres = try c.decodeIfPresent([String].self, forKey: .genres) ?? []
+        // `?? true` is load-bearing, not defensive padding: a stored snapshot
+        // written before this field existed has no key here, and a required
+        // decode would throw — which `SnapshotStore.load` swallows with
+        // `try?`, silently turning every launch into a cold network load. The
+        // same shape once blanked every track in the app (`CatalogTrack`).
+        isPlayable = try c.decodeIfPresent(Bool.self, forKey: .isPlayable) ?? true
+        releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
     }
 
     /// Returns a copy with the `catalogId` set. Used after the

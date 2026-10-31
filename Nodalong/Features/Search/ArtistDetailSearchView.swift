@@ -7,13 +7,13 @@ import NodalongKit
 /// whichever music service is currently connected. Albums navigate to
 /// AlbumDetail; top tracks play via `PlayerViewModel`.
 struct ArtistDetailSearchView: View {
+    @EnvironmentObject private var router: AppRouter
+    @Environment(\.dismiss) private var dismiss
     let artist: ArtistResult
 
     @EnvironmentObject private var musicService:   AppleMusicService
     @EnvironmentObject private var spotifyService: SpotifyMusicService
     @EnvironmentObject private var playerVM:  PlayerViewModel
-    @EnvironmentObject private var libraryVM: LibraryViewModel
-    @Environment(FirebaseAuthViewModel.self) private var authVM
 
     /// Whichever backend is actually connected — browsing must route here,
     /// not hardcode Apple Music.
@@ -29,6 +29,14 @@ struct ArtistDetailSearchView: View {
         case discovery = "Discovery"
     }
 
+    /// Scroll anchor on the hero, so a deliberate return to this page can put
+    /// it back at the top.
+    private static let topAnchor = "artistTop"
+
+    /// What `AppRouter` calls this screen — normalized exactly the way every
+    /// push site builds it, so a returned-to event can be matched here.
+    private var navIdentity: NavIdentity { .artist(name: artist.name) }
+
     @State private var albums:         [AlbumResult] = []
     @State private var topTracks:      [Song]        = []
     @State private var similarArtists: [ArtistResult] = []
@@ -37,12 +45,6 @@ struct ArtistDetailSearchView: View {
     @State private var hasLoaded       = false
     @State private var discographyTab: DiscographyTab = .albums
     @State private var topSongsPage = 0
-    /// True once `topTracks` holds the FULL top-songs list rather than just
-    /// `getArtistCore`'s first page. Gates the pagination arrows only — page
-    /// 1's five rows render immediately either way. Without this, the arrows
-    /// appear and the page count jumps 2 → 6 under the user a beat after the
-    /// screen paints, which is what read as Top Songs "refreshing itself".
-    @State private var topSongsComplete = false
     // Own page state per tab (rather than leaving it inside
     // `DiscographyPageGrid`) so `PageArrowsRow` can be rendered as a
     // sibling OUTSIDE the boxed grid — see `discographySection`. Reset to 0
@@ -52,6 +54,17 @@ struct ArtistDetailSearchView: View {
     // the `if/else` branch switch.
     @State private var albumsGridPage = 0
     @State private var discoveryGridPage = 0
+
+    /// The hero photo's requested size. A static so `CatalogPrefetch` can
+    /// warm exactly this rendition before the push.
+    @MainActor static var heroArtworkPoints: CGFloat { ScreenMetrics.bounds.width }
+
+    // Deliberately NOT seeded in `init`, unlike `AlbumDetailSearchView`.
+    // Top Songs and Discography are paging `TabView`s, and one that already
+    // has its pages when it is first built inside this scroll view drew an
+    // empty card (seen on device 2026-10-30). `loadData` reads the same
+    // cache synchronously instead (`peekCoreSync`), so a warm open fills on
+    // the first `.task` pass with no actor hop.
 
     // Newest release first — `releaseDate` is a plain "yyyy-MM-dd" string
     // (`AppleMusicService.dateFormatter`), so a lexicographic comparison
@@ -77,14 +90,30 @@ struct ArtistDetailSearchView: View {
     }
 
     var body: some View {
+        // ZStack, not `.overlay` on the scroll view. The overlay would be
+        // applied AFTER `.ignoresSafeArea(edges: .top)` and therefore share
+        // its coordinate space — the back button would sit under the clock,
+        // and correcting that needs a hardcoded status-bar height. This
+        // screen's hero has a documented history of exactly that mistake:
+        // four attempts at the bleed each needed A NUMBER, and every number
+        // was right in some presentation contexts and wrong in others.
+        //
+        // As ZStack siblings the scroll view ignores the safe area (so the
+        // photo reaches the very top) while the header does not (so the
+        // system places it below the status bar, on any device, in any
+        // presentation context). No number to get wrong.
+        ZStack(alignment: .topLeading) {
+        // Reader purely so a deliberate RETURN to this page (see
+        // `router.returnedTo`) can put it back at its top — a pop-back hands
+        // you this same view instance, still scrolled where you left it.
+        ScrollViewReader { proxy in
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                heroSection
+                heroSection.id(Self.topAnchor)
 
-                // While nothing has landed yet, show a skeleton instead of a
-                // bare spinner. The instant either section's data arrives
-                // (independently — see `loadData()`), that section renders
-                // for real; nothing here waits for the slower one anymore.
+                // Until the (complete) data lands, a skeleton the size of the
+                // real sections — they appear together, once, with nothing
+                // shifting afterwards. See `loadData()`.
                 if isLoading && topTracks.isEmpty && albums.isEmpty {
                     artistLoadingSkeleton
                 } else {
@@ -118,12 +147,41 @@ struct ArtistDetailSearchView: View {
         // number here that can be right in one place and wrong in another,
         // which was the actual failure mode all four previous times.
         .ignoresSafeArea(edges: .top)
-        .background(Color.nodalong.bgBase)
-        .navigationBarTitleDisplayMode(.inline)
-        // Without this the nav bar paints its own opaque background over
-        // the top of the photo — the purple band. Hiding it lets the photo
-        // show through behind the back button.
-        .toolbarBackground(.hidden, for: .navigationBar)
+        // A router pop-back returns this exact view instance, still scrolled
+        // wherever it was — so `artist → scroll to the discography → tap an
+        // album → tap the artist name` used to land you back mid-page. The
+        // identity guard means an artist page sitting in a different tab's
+        // stack ignores the event.
+        //
+        // Un-animated on purpose: this fires as the pop transition starts,
+        // and an animated scroll competing with it reads as a stutter. By
+        // the time the pop settles the page is simply at its top.
+        .onChange(of: router.returnedTo) { _, event in
+            guard let event, event.identity == navIdentity else { return }
+            proxy.scrollTo(Self.topAnchor, anchor: .top)
+        }
+        }
+
+        // No title — the hero already shows the artist name large.
+        //
+        // `.toolbarBackground(.hidden, for: .navigationBar)` used to be
+        // required here so the bar's opaque `bgBase` didn't paint a purple
+        // band across the top of the photo. It committed a frame or two into
+        // the push, so the band was visible during the transition and then
+        // vanished. With no bar there is nothing to hide and nothing to
+        // flicker.
+        }
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        // 🔴 `onBack` is load-bearing here and nowhere else: it collapses a
+        // whole run of artist→artist hops in one press, so Similar Artists
+        // browsing doesn't cost n back presses to leave. This chevron is its
+        // ONLY trigger — dropping the closure silently breaks that. Falls back
+        // to the ordinary one-level pop if this screen ever ends up somewhere
+        // the router doesn't own.
+        .screenControls(onBack: {
+            if !router.popArtistRun(onto: router.selectedTab) { dismiss() }
+        })
         // The grid is now pushed by VALUE (`NavigationLink(value:)` on the
         // "See all" button) rather than by an `.navigationDestination(item:)`
         // binding. That item binding was the actual cause of the
@@ -150,6 +208,16 @@ struct ArtistDetailSearchView: View {
             )
         }
         .task { await loadData() }
+        // TEMPORARY [Nodalong.Nav] — counts how many instances of this screen
+        // actually exist, so the reported duplicate is a fact rather than a
+        // report. The router logs what it DECIDED; this logs what happened.
+        // Remove with the rest of the nav diagnostics.
+        .onAppear {
+            // Same reason as the album screen: an artist reached through a
+            // `NavigationLink` leaves a `nil` slot the dedup can't match.
+            router.claimTopIdentity(navIdentity, onto: router.selectedTab)
+            navLog("ArtistDetailSearchView.onAppear id=\(artist.id) name=\(artist.name)")
+        }
     }
 
     // MARK: - Hero
@@ -167,7 +235,7 @@ struct ArtistDetailSearchView: View {
     /// system status bar / nav bar, like every other screen in the app.
     @ViewBuilder
     private var heroSection: some View {
-        let heroURL = ArtworkURL.sized(artist.imageUrl, points: ScreenMetrics.bounds.width)
+        let heroURL = ArtworkURL.sized(artist.imageUrl, points: Self.heroArtworkPoints)
         // ROOT CAUSE of the long-running "artist name is missing" bug: the
         // previous versions put the photo AND the title as siblings inside
         // one `ZStack`, then applied `.frame(height: 260).clipped()` to the
@@ -234,13 +302,29 @@ struct ArtistDetailSearchView: View {
 
     /// Shown only until either section has data — see the `body` condition.
     @ViewBuilder
+    /// Placeholder the size of the real Top Songs card and Discography block,
+    /// so the swap to real content moves nothing below it. Both sections are
+    /// fixed-size by design (five 56pt rows; a 2×2 grid), which is what makes
+    /// a same-size placeholder possible at all.
     private var artistLoadingSkeleton: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Top Songs")
                 .font(Font.nodalong.headline)
                 .foregroundStyle(Color.nodalong.textPrimary)
                 .padding(.horizontal, 20)
-            SkeletonRail(tileSize: 100)
+            ShimmerView()
+                .frame(height: 5 * 56 + 28)
+                .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+                .padding(.horizontal, 20)
+            Text("Discography")
+                .font(Font.nodalong.headline)
+                .foregroundStyle(Color.nodalong.textPrimary)
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+            ShimmerView()
+                .frame(height: 380)
+                .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+                .padding(.horizontal, 20)
         }
         .padding(.top, 20)
     }
@@ -277,7 +361,7 @@ struct ArtistDetailSearchView: View {
             // Bottom-left/right, matching `SpotlightCarousel`'s bare
             // chevron style — a discrete row below the card, not an
             // overlay, so it can't sit on top of the last track row.
-            if topSongsComplete && pages.count > 1 {
+            if pages.count > 1 {
                 PageArrowsRow(pageIndex: $topSongsPage, pageCount: pages.count)
                     .padding(.horizontal, 20)
             }
@@ -287,7 +371,6 @@ struct ArtistDetailSearchView: View {
 
     @ViewBuilder
     private func popularTrackRow(_ song: Song) -> some View {
-        let isLiked = libraryVM.isInLibrary(catalogId: song.catalogId, uri: song.uri)
         HStack(spacing: 12) {
             ArtworkThumbnail(url: song.artwork, size: 44, isTrack: true)
             VStack(alignment: .leading, spacing: 2) {
@@ -303,26 +386,7 @@ struct ArtistDetailSearchView: View {
             Spacer()
             TrackActionsMenuButton(
                 song:         song,
-                onAddToQueue: { playerVM.addToQueue(song) },
-                onToggleLike: {
-                    guard let uid = authVM.currentUser?.uid else { return }
-                    let doc = LibraryTrackDoc(
-                        catalogId:     song.catalogId ?? "",
-                        title:         song.title,
-                        artist:        song.artist,
-                        album:         song.album,
-                        artwork:       song.artwork,
-                        uri:           song.uri,
-                        sourceService: song.sourceService,
-                        isrc:          song.isrc,
-                        duration:      song.duration,
-                        trackNumber:   song.trackNumber,
-                        albumReleaseDate: song.albumReleaseDate,
-                        savedAt:       Date().timeIntervalSince1970 * 1000
-                    )
-                    Task { await libraryVM.toggleLibrary(uid: uid, track: doc) }
-                },
-                isLiked: isLiked
+                onAddToQueue: { playerVM.addToQueue(song) }
             )
         }
         .frame(height: 56)
@@ -475,7 +539,7 @@ struct ArtistDetailSearchView: View {
             HStack(spacing: 4) {
                 MarqueeText(text: album.name, font: Font.nodalong.subheadlineSemibold, color: Color.nodalong.textPrimary)
                 if album.isExplicit {
-                    explicitBadge
+                    ExplicitBadge()
                 }
             }
             Text("\(String(album.releaseDate.prefix(4))) · \(album.totalTracks) track\(album.totalTracks == 1 ? "" : "s")")
@@ -484,16 +548,6 @@ struct ArtistDetailSearchView: View {
                 .lineLimit(1)
         }
         .frame(width: width, alignment: .leading)
-    }
-
-    /// The standard boxed-E explicit-content mark (matches the convention
-    /// other music apps use) — shown inline next to a title, not stamped on
-    /// the artwork itself.
-    private var explicitBadge: some View {
-        Text("🅴")
-            .font(Font.nodalong.caption)
-            .foregroundStyle(Color.nodalong.textSecondary)
-            .fixedSize()
     }
 
     // MARK: - Similar artists
@@ -511,7 +565,9 @@ struct ArtistDetailSearchView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(alignment: .top, spacing: 16) {
                     ForEach(similarArtists) { similar in
-                        NavigationLink(value: similar) {
+                        Button {
+                            router.push(similar, identity: .artist(name: similar.name))
+                        } label: {
                             VStack(spacing: 6) {
                                 ArtworkThumbnail(url: similar.imageUrl, size: 64, circular: true)
                                 // Reverted from MarqueeText, per direct
@@ -531,6 +587,10 @@ struct ArtistDetailSearchView: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        .task(id: similar.id, priority: .utility) {
+                            guard activeService.serviceType == .appleMusic else { return }
+                            await CatalogPrefetch.artist(similar, service: musicService)
+                        }
                     }
                 }
                 .padding(12)
@@ -565,107 +625,52 @@ struct ArtistDetailSearchView: View {
         defer { isLoading = false; hasLoaded = true }
 
         if playerVM.activeService == .appleMusic {
-            // Session-cached; core (albums/top songs) and extras (similar
-            // artists/features-on) are two independent MusicKit requests —
-            // see `AppleMusicService.getArtistCore`'s doc comment for why.
-            // Both `async let`s start concurrently; each `@State` assignment
-            // below fires the instant ITS OWN fetch resolves, so Discography/
-            // Top Songs render without waiting on Similar Artists/Features On
-            // too (a revisit to either is an instant cache hit either way).
             let service = musicService
             let artistId = artist.id
-            async let coreResult = MusicDetailCache.shared.core(artistId: artistId) {
-                guard let c = try? await service.getArtistCore(artistId: artistId) else { return nil }
-                return ArtistCoreDetails(albums: c.albums, topTracks: c.topTracks)
-            }
             async let extrasResult = MusicDetailCache.shared.extras(artistId: artistId) {
                 guard let e = try? await service.getArtistExtras(artistId: artistId) else { return nil }
                 return ArtistExtraDetails(similarArtists: e.similarArtists, featuresOn: e.featuresOn)
             }
-            if let core = await coreResult {
-                if albums != core.albums { albums = core.albums }
-                if topTracks != core.topTracks { topTracks = core.topTracks }
-                // A warm cache already holds the full list, so there's
-                // nothing left to top up — show the arrows immediately.
-                if core.topTracks.count >= 30 { topSongsComplete = true }
-                preferDiscoveryTabIfAlbumsEmpty()
-                // Browse-time prefetch — same trick as Search/Home: someone
-                // reading this artist's Discography is a likely next tap,
-                // so warm the first few albums' track lists now instead of
-                // waiting for the tap. Bounded to what's visible without
-                // scrolling the carousel.
-                for album in core.albums.prefix(6) {
-                    let (albumId, albumName, artwork) = (album.id, album.name, album.artwork)
-                    Task {
-                        _ = await MusicDetailCache.shared.tracks(albumId: albumId) {
-                            (try? await service.getAlbumTracks(albumId: albumId, albumName: albumName, artwork: artwork)) ?? []
-                        }
+
+            if let cached = MusicDetailCache.peekCoreSync(artistId: artistId) {
+                // Warm (visited or prefetched): the COMPLETE lists are already
+                // here, so show them straight away. Nothing left to append.
+                albums = cached.albums
+                topTracks = cached.topTracks
+            } else {
+                // Cold: first paint from ONE cheap request, then APPEND the
+                // rest. Both start now, so the full fetch isn't queued behind
+                // the first page.
+                //
+                // Append-only is the rule. The previous version replaced the
+                // lists when the full ones landed, which re-sorted Discography
+                // and grew the Top Songs pager under the user. Here whatever
+                // the first page showed keeps its position; additions can only
+                // appear after it (see `appendingNew`).
+                let firstTask = Task { try? await service.getArtistFirstPage(artistId: artistId) }
+                let fullTask = Task {
+                    await MusicDetailCache.shared.core(artistId: artistId) {
+                        guard let c = try? await service.getArtistCore(artistId: artistId) else { return nil }
+                        return ArtistCoreDetails(albums: c.albums, topTracks: c.topTracks)
                     }
                 }
-                // Background top-up: `getArtistCore` now deliberately returns
-                // only the first page of top songs (one round trip) — real
-                // device timing showed paginating to 30 inside the critical
-                // path cost 507–1104ms, 55–74% of the whole artist-page load.
-                // This tops `topTracks` up to 30 off the critical path;
-                // `trackPages` re-paginates reactively, so pages just grow
-                // from 2 to 6 with no other change. Guarded so a revisit
-                // (already-full cache) doesn't kick off a redundant fetch.
-                if core.topTracks.count < 30 {
-                    Task {
-                        guard let full = try? await service.getArtistTopSongsFull(artistId: artistId),
-                              full.count > topTracks.count else {
-                            // Nothing more to come — release the arrows so a
-                            // multi-page artist isn't left unpageable.
-                            topSongsComplete = true
-                            return
-                        }
-                        topTracks = full
-                        topSongsComplete = true
-                        await MusicDetailCache.shared.updateTopTracks(artistId: artistId, topTracks: full)
-                    }
-                } else {
-                    topSongsComplete = true
+                if let first = await firstTask.value {
+                    albums = first.albums
+                    topTracks = first.topTracks
                 }
-                // Same background top-up, for albums — `getArtistCore`'s own
-                // `.albums` relationship turned out to have the identical
-                // "one unpaginated page from Apple, nothing tops it up"
-                // limitation topSongs already had (see
-                // `getArtistAlbumsFull`'s doc comment — this is what was
-                // actually causing the Discography grid's first page to
-                // sometimes show fewer albums than it should on a cold,
-                // never-before-viewed artist; not a rendering bug at all).
-                if core.albums.count < 50 {
-                    Task {
-                        guard let full = try? await service.getArtistAlbumsFull(artistId: artistId),
-                              full.count > albums.count, full != albums else { return }
-                        albums = full
-                        preferDiscoveryTabIfAlbumsEmpty()
-                        await MusicDetailCache.shared.updateAlbums(artistId: artistId, albums: full)
-                    }
+                // Awaiting `firstTask` above is what guarantees the append can
+                // never run before (and be overwritten by) the first paint.
+                Task {
+                    guard let full = await fullTask.value else { return }
+                    topTracks = topTracks.appendingNew(from: full.topTracks)
+                    albums = albums.appendingNewAlbums(from: full.albums)
                 }
             }
             if let extras = await extrasResult {
                 similarArtists = extras.similarArtists
                 featuresOn = extras.featuresOn
-                preferDiscoveryTabIfAlbumsEmpty()
-                for similar in extras.similarArtists.prefix(6) {
-                    let similarId = similar.id
-                    Task {
-                        _ = await MusicDetailCache.shared.core(artistId: similarId) {
-                            guard let c = try? await service.getArtistCore(artistId: similarId) else { return nil }
-                            return ArtistCoreDetails(albums: c.albums, topTracks: c.topTracks)
-                        }
-                    }
-                }
-                for album in extras.featuresOn.prefix(6) {
-                    let (albumId, albumName, artwork) = (album.id, album.name, album.artwork)
-                    Task {
-                        _ = await MusicDetailCache.shared.tracks(albumId: albumId) {
-                            (try? await service.getAlbumTracks(albumId: albumId, albumName: albumName, artwork: artwork)) ?? []
-                        }
-                    }
-                }
             }
+            preferDiscoveryTabIfAlbumsEmpty()
         } else {
             // Suspended-Spotify fallback (see CLAUDE.md) — keeps the
             // protocol pair, but each section now assigns the instant its
@@ -678,7 +683,6 @@ struct ArtistDetailSearchView: View {
             if let a = await albumsTask.value { albums = a }
             if let t = await topTracksTask.value { topTracks = t }
             // No two-phase top-up on this path — whatever landed is final.
-            topSongsComplete = true
             preferDiscoveryTabIfAlbumsEmpty()
         }
     }
@@ -727,11 +731,14 @@ private func discographyPageCount(for albumList: [AlbumResult]) -> Int {
 /// its content is top-aligned) rather than the taller pages getting
 /// centred and cropped.
 private struct DiscographyPageGrid<CardContent: View>: View {
+    @EnvironmentObject private var router: AppRouter
     let albumList: [AlbumResult]
     let emptyMessage: String
     let cardWidth: CGFloat
     @Binding var pageIndex: Int
     @ViewBuilder let cardContent: (AlbumResult) -> CardContent
+    @EnvironmentObject private var musicService: AppleMusicService
+    @EnvironmentObject private var playerVM:     PlayerViewModel
 
     /// Room reserved below each disc for its title + caption line.
     ///
@@ -828,10 +835,25 @@ private struct DiscographyPageGrid<CardContent: View>: View {
                                     let i = row * 2 + col
                                     if i < chunk.count {
                                         let album = chunk[i]
-                                        NavigationLink(value: album) {
+                                        Button {
+                                            router.push(album, identity: .album(name: album.name,
+                                                                                artist: album.artistName))
+                                        } label: {
                                             cardContent(album)
                                         }
                                         .buttonStyle(.plain)
+                                        // Per-card prefetch. This grid is
+                                        // eager (not lazy — see the class
+                                        // comment), but it is PAGED, so only
+                                        // the current page's four cards are
+                                        // ever on screen and the `.task`
+                                        // still tracks that.
+                                        .task(id: album.id, priority: .utility) {
+                                            guard playerVM.activeService == .appleMusic else { return }
+                                            await CatalogPrefetch.album(id: album.id, name: album.name,
+                                                                        artwork: album.artwork, releaseDate: album.releaseDate,
+                                                    artist: album.artistName, service: musicService)
+                                        }
                                     } else {
                                         Color.clear.frame(maxWidth: .infinity)
                                     }
@@ -882,8 +904,11 @@ private struct DiscographyPageGrid<CardContent: View>: View {
 /// on `ArtistDetailSearchView`), matching Apple Music's own "see all"
 /// pattern for a bigger, browsable view than the horizontal carousel.
 private struct DiscographyGridView: View {
+    @EnvironmentObject private var router: AppRouter
     let title: String
     let albums: [AlbumResult]
+    @EnvironmentObject private var musicService: AppleMusicService
+    @EnvironmentObject private var playerVM:     PlayerViewModel
 
     private let columns = [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)]
 
@@ -901,20 +926,22 @@ private struct DiscographyGridView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
+            // In-content heading: a bare grid of album covers has nothing
+            // else saying which artist's discography this is.
+            ScreenTitle(title)
             LazyVGrid(columns: columns, spacing: 20) {
                 ForEach(albums) { album in
-                    NavigationLink(value: album) {
+                    Button {
+                        router.push(album, identity: .album(name: album.name, artist: album.artistName))
+                    } label: {
                         VStack(alignment: .leading, spacing: 6) {
                             ArtworkThumbnail(url: album.artwork, size: cellWidth, isAlbum: true)
-                                .clipShape(RoundedRectangle(cornerRadius: Corner.artwork, style: .continuous))
                             HStack(spacing: 4) {
                                 MarqueeText(text: album.name, font: Font.nodalong.subheadlineMedium, color: Color.nodalong.textPrimary)
                                 if album.isExplicit {
-                                    Text("🅴")
-                                        .font(Font.nodalong.caption2)
-                                        .foregroundStyle(Color.nodalong.textSecondary)
-                                        .fixedSize()
+                                    ExplicitBadge()
                                 }
                             }
                             Text(String(album.releaseDate.prefix(4)))
@@ -925,11 +952,23 @@ private struct DiscographyGridView: View {
                         .contentShape(.rect)
                     }
                     .buttonStyle(.plain)
+                    // Per-cell prefetch inside a `LazyVGrid`, so it follows
+                    // the scroll. This screen is exactly where the old
+                    // screen-level `prefix(6)` fell down: it warmed the first
+                    // six of the CAROUSEL, while this grid lists the artist's
+                    // whole discography — every cell past the sixth opened
+                    // cold no matter how long you looked at it.
+                    .task(id: album.id, priority: .utility) {
+                        guard playerVM.activeService == .appleMusic else { return }
+                        await CatalogPrefetch.album(id: album.id, name: album.name,
+                                                    artwork: album.artwork, releaseDate: album.releaseDate,
+                                                    artist: album.artistName, service: musicService)
+                    }
                 }
             }
             .padding(20)
         }
-        .background(Color.nodalong.bgBase)
+        .screenBackground()
         // No `AlbumResult` destination declared here on purpose. An earlier
         // fix added one under the belief that the closest ancestor wins for
         // duplicate same-type destinations — SwiftUI actually resolves in
@@ -938,8 +977,9 @@ private struct DiscographyGridView: View {
         // the ambient registration on whichever stack this sits in
         // (Home / Search / Shelf / the player's sheet), all of which push
         // `AlbumDetailSearchView`.
-        .navigationTitle(title)
-        .navigationBarTitleDisplayMode(.inline)
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .screenControls()
     }
 }
 
@@ -951,3 +991,32 @@ private struct DiscographyGridView: View {
     .withPreviewEnvironment()
 }
 #endif
+
+// MARK: - Append-only merging
+
+extension Array where Element: Identifiable {
+    /// `self` unchanged, followed by anything in `full` whose id isn't already
+    /// here. Existing elements never move, which is the whole point: a list
+    /// already on screen may only grow at its end.
+    func appendingNew(from full: [Element]) -> [Element] {
+        let have = Set(map(\.id))
+        let additions = full.filter { !have.contains($0.id) }
+        return additions.isEmpty ? self : self + additions
+    }
+}
+
+extension Array where Element == AlbumResult {
+    /// As `appendingNew`, but also skips an album that is just another EDITION
+    /// of one already shown. The first page was edition-deduped on its own, so
+    /// the full list can pick a different edition as primary (the explicit
+    /// cut where the first page happened to hold the clean one); appending it
+    /// would put the same record on screen twice.
+    func appendingNewAlbums(from full: [AlbumResult]) -> [AlbumResult] {
+        let haveIds = Set(map(\.id))
+        let haveTitles = Set(map { canonicalAlbumTitle($0.name) })
+        let additions = full.filter {
+            !haveIds.contains($0.id) && !haveTitles.contains(canonicalAlbumTitle($0.name))
+        }
+        return additions.isEmpty ? self : self + additions
+    }
+}

@@ -20,6 +20,25 @@ enum ScreenMetrics {
         currentScreen?.scale ?? 3
     }
 
+    /// The device's true safe-area insets, read straight from the key window.
+    ///
+    /// Unlike the SwiftUI environment (or a `GeometryReader`) **inside a
+    /// presented cover**, the window's own `safeAreaInsets` reflect only the
+    /// physical notch / Dynamic Island / home indicator — they never carry a
+    /// phantom inset leaked from an ancestor's `safeAreaInset`, which is the
+    /// bug that took several rounds to settle in `NowPlayingView`. Any
+    /// full-screen cover that pins itself to `bounds` should re-apply these
+    /// rather than trusting its own environment.
+    @MainActor
+    static var safeAreaInsets: UIEdgeInsets {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }?
+            .safeAreaInsets
+            ?? UIEdgeInsets(top: 50, left: 0, bottom: 34, right: 0)
+    }
+
     /// The screen of the first connected window scene. `nil` only in the
     /// pathological case where no scene has connected yet — SwiftUI content
     /// shouldn't be evaluating at that point, so the fallbacks above exist

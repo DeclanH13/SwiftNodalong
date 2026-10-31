@@ -90,6 +90,7 @@ func ensureCatalogId(forLibrary doc: LibraryTrackDoc) async throws -> String {
         isrc:              doc.isrc,
         trackNumber:       doc.trackNumber,
         albumReleaseDate:  doc.albumReleaseDate,
+        isExplicit:        doc.isExplicit,
         appleMusicUri:     doc.uri,
         appleMusicTrackId: doc.uri
     ))

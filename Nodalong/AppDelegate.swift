@@ -22,6 +22,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // TEMPORARY DIAGNOSTIC — see CLAUDE.md decisions log (fresh-install
         // Search-tab lag investigation). Remove once resolved.
         MainThreadHangDetector.start()
+        Task { @MainActor in KeyboardLatencyProbe.start() }
+        // Always-on (Release too), privacy-safe flight recorder + MetricKit —
+        // see `FieldDiagnostics.swift`. Unlike everything above it, this is
+        // meant to still be running when the phone is in a pocket.
+        FieldLog.start()
         diagLog("app launch: didFinishLaunching")
         // The window doesn't exist yet at this point (confirmed: 0 scenes,
         // 0 windows here), so its background has to be applied once one

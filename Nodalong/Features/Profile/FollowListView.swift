@@ -53,6 +53,23 @@ struct FollowListView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            // STAGE 0 SPIKE — first screen converted off the nav bar.
+            // Gating question: does swipe-from-left-edge still pop with
+            // `.toolbar(.hidden, for: .navigationBar)`? If not, the app-wide
+            // removal is not viable as designed and this reverts.
+            // In-content heading: a list of people is otherwise silent on
+            // whether these are followers or following.
+            ScreenTitle(followListTitle)
+            list
+        }
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        .screenControls()
+        .task { await load() }
+    }
+
+    private var list: some View {
         List {
             if isLoading, profiles.isEmpty {
                 ProgressView()
@@ -83,10 +100,6 @@ struct FollowListView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
-        .background(Color.nodalong.bgBase)
-        .navigationTitle(followListTitle)
-        .navigationBarTitleDisplayMode(.inline)
-        .task { await load() }
     }
 
     @ViewBuilder

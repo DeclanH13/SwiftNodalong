@@ -12,7 +12,7 @@ import NodalongKit
 ///   Albums / Songs. Lets the user narrow what they're after; we send the
 ///   matching focused request to the catalog to save quota.
 ///
-/// Both axes are debounced by the same 300 ms timer so quick toggle-while-
+/// Both axes are debounced by the same 150 ms timer so quick toggle-while-
 /// typing collapses into one network call.
 @MainActor
 final class SearchViewModel: ObservableObject {
@@ -42,13 +42,51 @@ final class SearchViewModel: ObservableObject {
     /// User results. Only populated when `mode == .people`.
     @Published private(set) var userResults: [UserProfile] = []
 
+    /// The unified, word-match-ranked list shown for the All scope. Rebuilt
+    /// whenever results arrive or the taste weights change.
+    @Published private(set) var rankedHits: [SearchHit] = []
+    /// What the user listens to — set by `SearchView` from `LibraryViewModel`.
+    /// Only ever breaks ties within a match tier. See `rankSearchHits`.
+    var taste: TasteWeights = .empty {
+        didSet { if oldValue != taste { rerank() } }
+    }
+
     /// Music catalog results. Sections are populated selectively based on
     /// `scope` — e.g. `.songs` leaves `artists` and `albums` empty so the UI
     /// doesn't render stale data after a scope swap.
-    @Published private(set) var results: CombinedSearchResults = .empty
+    @Published private(set) var results: CombinedSearchResults = .empty {
+        didSet { rerank() }
+    }
+    private var resultCache: [String: (results: CombinedSearchResults, at: Date)] = [:]
+    private static let resultCacheTTL: TimeInterval = 300
+    private static let resultCacheLimit = 20
+
+    /// The query `results` were fetched for (the live `query` may already be
+    /// a keystroke ahead of it).
+    private var resultsQuery = ""
+
+    private func rerank() {
+        guard scope == .all, !resultsQuery.isEmpty else { rankedHits = []; return }
+        let hits = results.artists.map(SearchHit.artist)
+            + results.albums.map(SearchHit.album)
+            + results.tracks.map(SearchHit.track)
+        rankedHits = rankSearchHits(hits, query: resultsQuery, taste: taste)
+    }
 
     @Published private(set) var isSearching    = false
     @Published private(set) var followingUids: Set<String> = []
+
+    /// A genuinely genre-scoped songs chart, shown instead of `results`
+    /// when a genre tile is tapped — deliberately a fully separate piece
+    /// of state from `query`/`mode`/`scope` rather than layered on top of
+    /// them. Setting `query` to the genre name and reusing the normal
+    /// `.onChange`-driven search machinery was the first design and was
+    /// rejected: that debounced free-text search would fire ~300ms later
+    /// and silently overwrite these correct results with the exact
+    /// wrong-genre problem this exists to fix (see `showGenreChart`).
+    @Published private(set) var genreChartName: String? = nil
+    @Published private(set) var genreChartTracks: [SearchItem] = []
+    private var genreTask: Task<Void, Never>? = nil
 
     /// The real underlying error from the most recent failed catalog call,
     /// when one occurred — distinguishes "genuinely no results" from "the
@@ -120,6 +158,34 @@ final class SearchViewModel: ObservableObject {
     @Published private(set) var liveNow: [LiveNowEntry] = []
     @Published private(set) var popularAlbums: [AlbumResult] = []
 
+    /// Popular albums are the same for everyone, so they persist under the
+    /// shared `_catalog` pseudo-uid (like `MusicDetailCache`) and restore
+    /// synchronously — the browse rail is populated on the first frame.
+    private static let popularAlbumsKey = "popularAlbums"
+    private static let sharedUid = "_catalog"
+
+    init() {
+        if ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] != "1",
+           let saved = SnapshotStore.load([AlbumResult].self, key: Self.popularAlbumsKey, uid: Self.sharedUid) {
+            popularAlbums = saved
+        }
+    }
+
+    /// Fetches the popular-albums rail at launch (it doesn't depend on the
+    /// follow graph), so Search's first open already has it. No-op if there.
+    func warmPopularAlbums(musicService: AppleMusicService) async {
+        guard musicService.isAuthenticated else { return }
+        if let fresh = try? await musicService.getPopularAlbums(limit: 10), !fresh.isEmpty {
+            if popularAlbums != fresh { popularAlbums = fresh }
+            SnapshotStore.save(fresh, key: Self.popularAlbumsKey, uid: Self.sharedUid)
+        }
+    }
+
+    /// Genre charts turn over daily — cache them per genre for a few hours so
+    /// re-tapping a tile (or coming back) is instant.
+    private var genreChartCache: [String: (songs: [SearchItem], at: Date)] = [:]
+    private static let genreChartTTL: TimeInterval = 6 * 3600
+
     /// Tracks which uid's browse content is currently loaded — mirrors
     /// `LibraryViewModel.loadedForUid` so an account switch re-fetches
     /// instead of silently showing the previous account's data.
@@ -140,7 +206,11 @@ final class SearchViewModel: ObservableObject {
         async let suggested: [UserProfile] = (try? await getSuggestedUsers(excluding: excluded)) ?? []
         async let live: [LiveNowEntry] = loadLiveNow(followingUids: followingUids)
 
-        popularAlbums  = await albums
+        let fetchedAlbums = await albums
+        if !fetchedAlbums.isEmpty {
+            popularAlbums = fetchedAlbums
+            SnapshotStore.save(fetchedAlbums, key: Self.popularAlbumsKey, uid: Self.sharedUid)
+        }
         suggestedUsers = await suggested
         liveNow        = await live
     }
@@ -170,7 +240,7 @@ final class SearchViewModel: ObservableObject {
                         return LiveNowEntry(
                             uid: uid, username: profile.username,
                             avatarEmoji: profile.avatarEmoji, avatarColor: profile.avatarColor,
-                            kind: .listening(catalogId: nowPlaying.catalogId)
+                            kind: .listening(catalogId: nowPlaying.catalogId, isPreviewPlayback: nowPlaying.isPreviewPlayback)
                         )
                     }
                 }
@@ -214,7 +284,7 @@ final class SearchViewModel: ObservableObject {
     /// Kick off a search. Reads the current `mode` / `scope` / `query`
     /// snapshot. Called from `.onChange` of any of those.
     ///
-    /// `debounce`: `true` (default) for query text changes — the 300 ms
+    /// `debounce`: `true` (default) for query text changes — the 150 ms
     /// sleep lets the user keep typing without spamming the backend.
     /// `false` for a mode/scope tap — that's already a single, deliberate
     /// action with nothing more coming, so waiting out a debounce meant for
@@ -222,6 +292,8 @@ final class SearchViewModel: ObservableObject {
     /// tap.
     func search(via service: any MusicService, debounce: Bool = true) {
         searchTask?.cancel()
+        genreTask?.cancel()
+        genreChartName = nil
         lastSearchErrorDetail = nil
         let q = query.trimmingCharacters(in: .whitespaces)
         guard q.count >= 2 else {
@@ -231,9 +303,10 @@ final class SearchViewModel: ObservableObject {
         }
         let currentMode  = mode
         let currentScope = scope
+        completionTask?.cancel()
         searchTask = Task {
             if debounce {
-                try? await Task.sleep(nanoseconds: 300_000_000)
+                try? await Task.sleep(nanoseconds: 150_000_000)
                 guard !Task.isCancelled else { return }
             }
             isSearching = true
@@ -246,9 +319,49 @@ final class SearchViewModel: ObservableObject {
     /// in the search bar.
     func clear() {
         searchTask?.cancel()
+        genreTask?.cancel()
+        genreChartName = nil
         query       = ""
         userResults = []
         results     = .empty
+    }
+
+    // MARK: - Genre charts (browse-state genre tiles)
+
+    /// Shows a genuinely genre-scoped chart of songs, bypassing free-text
+    /// search entirely — the fix for genre tiles returning whatever's
+    /// merely popular under a keyword match (e.g. "Rock" surfacing a
+    /// top-charting pop artist) rather than anything actually in that
+    /// genre. Apple-only: `AppleMusicService.getGenreChartSongs` is a
+    /// concrete-service method, not part of `MusicService`, mirroring
+    /// `loadBrowseContent`'s existing precedent for `getPopularAlbums`.
+    func showGenreChart(_ genreName: String, musicService: AppleMusicService) {
+        searchTask?.cancel()
+        genreTask?.cancel()
+        lastSearchErrorDetail = nil
+        genreChartName = genreName
+        if let hit = genreChartCache[genreName.lowercased()], Date().timeIntervalSince(hit.at) < Self.genreChartTTL {
+            genreChartTracks = hit.songs
+            isSearching = false
+            return
+        }
+        genreChartTracks = []
+        isSearching = true
+        genreTask = Task {
+            defer { isSearching = false }
+            let songs = await musicService.getGenreChartSongs(genreName: genreName, limit: 25)
+            guard !Task.isCancelled else { return }
+            let items = songs.map(Self.songToSearchItem)
+            genreChartTracks = items
+            if !items.isEmpty { genreChartCache[genreName.lowercased()] = (items, Date()) }
+        }
+    }
+
+    /// Dismisses the genre chart back to the normal browse state.
+    func exitGenreChart() {
+        genreTask?.cancel()
+        genreChartName = nil
+        genreChartTracks = []
     }
 
     // MARK: - Private
@@ -284,10 +397,88 @@ final class SearchViewModel: ObservableObject {
                 results = .empty
                 return
             }
+            // Session cache: backspacing, retyping or returning to a query is
+            // instant instead of another round trip.
+            let cacheKey = "\(service.serviceType.rawValue)|\(scope.rawValue)|\(query.lowercased())"
+            if let hit = resultCache[cacheKey], Date().timeIntervalSince(hit.at) < Self.resultCacheTTL {
+                resultsQuery = query
+                results = hit.results
+                FieldLog.event("search", "\(scope.rawValue) cache=hit")
+                return
+            }
+            if scope == .all { startArtistCompletions(query: query, cacheKey: cacheKey, service: service) }
+            let started = Date()
             let fetched = await fetchMusic(query: query, scope: scope, service: service)
             guard !Task.isCancelled else { return }
+            // Numbers only — never the query text (the field log's privacy contract).
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            let hitCount = fetched.artists.count + fetched.albums.count + fetched.tracks.count
+            FieldLog.event("search", "\(scope.rawValue) took \(ms)ms hits=\(hitCount) cache=miss")
+            if hitCount > 0 {
+                resultCache[cacheKey] = (fetched, Date())
+                if resultCache.count > Self.resultCacheLimit {
+                    for key in resultCache.sorted(by: { $0.value.at < $1.value.at }).prefix(resultCache.count - Self.resultCacheLimit).map(\.key) {
+                        resultCache[key] = nil
+                    }
+                }
+            }
+            resultsQuery = query
             results = fetched
+            // Completions that landed before the main results are merged now.
+            applyExtraArtists(for: query, cacheKey: cacheKey)
         }
+    }
+
+    // MARK: - Artists while still typing
+
+    /// Names the local prefix matcher draws from (your Shelf artists); set by
+    /// `SearchView`. Recent artist searches are added automatically.
+    var localArtistCandidates: [String] = []
+
+    private var completionTask: Task<Void, Never>?
+    private var extraArtists: [String: [ArtistResult]] = [:]
+
+    /// Starts, alongside the main request, two ways of finding the artist for a
+    /// half-typed query: your own artists that the text could be heading towards
+    /// (instant when already resolved), and Apple's suggestions endpoint. They
+    /// merge into the list whenever they land — never delaying the main results.
+    private func startArtistCompletions(query: String, cacheKey: String, service: any MusicService) {
+        guard let apple = service as? AppleMusicService,
+              query.trimmingCharacters(in: .whitespaces).count >= 3 else { return }
+        completionTask?.cancel()
+        let candidates = localArtistCandidates
+            + recentSearches.filter { $0.kind == .artist }.map(\.displayName)
+        let local = localArtistMatches(query: query, candidates: candidates, weights: taste, limit: 2)
+        completionTask = Task { [weak self] in
+            async let remote = apple.artistCompletions(for: query)
+            var resolvedLocal: [ArtistResult] = []
+            for name in local {
+                // Through the persistent name cache: free after the first time.
+                if let r = await MusicDetailCache.shared.resolveArtistByName(name, fetch: {
+                    let found = try? await apple.searchAll(name, maxPerType: 1)
+                    return found?.artists.first
+                }) { resolvedLocal.append(r) }
+            }
+            let remoteArtists = await remote
+            guard !Task.isCancelled else { return }
+            await self?.finishCompletions(query: query, cacheKey: cacheKey, local: resolvedLocal, remote: remoteArtists)
+        }
+    }
+
+    private func finishCompletions(query: String, cacheKey: String, local: [ArtistResult], remote: [ArtistResult]) {
+        // Numbers only — never the query text (the field log's privacy contract).
+        FieldLog.event("search", "artist via local=\(local.count) suggestions=\(remote.count) main=\(results.artists.count)")
+        extraArtists[query.lowercased()] = mergingArtists(local, into: remote)
+        if extraArtists.count > 20 { extraArtists = [query.lowercased(): extraArtists[query.lowercased()] ?? []] }
+        applyExtraArtists(for: query, cacheKey: cacheKey)
+    }
+
+    private func applyExtraArtists(for query: String, cacheKey: String) {
+        guard resultsQuery == query, let extra = extraArtists[query.lowercased()], !extra.isEmpty else { return }
+        let merged = mergingArtists(extra, into: results.artists)
+        guard merged.count != results.artists.count else { return }
+        results = CombinedSearchResults(artists: merged, albums: results.albums, tracks: results.tracks)
+        resultCache[cacheKey] = (results, Date())
     }
 
     /// Per-scope dispatcher. `.all` runs the multi-type request; the others
@@ -303,7 +494,7 @@ final class SearchViewModel: ObservableObject {
         switch scope {
         case .all:
             do {
-                let raw = try await service.searchAll(query, maxPerType: 10)
+                let raw = try await service.searchAll(query, maxPerType: 12)
                 return CombinedSearchResults(
                     artists: raw.artists,
                     albums:  raw.albums,
@@ -394,7 +585,10 @@ final class SearchViewModel: ObservableObject {
             trackNumber:      song.trackNumber,
             albumReleaseDate: song.albumReleaseDate,
             sourceService:    song.sourceService,
-            isExplicit:       song.isExplicit
+            isExplicit:       song.isExplicit,
+            isPlayable:       song.isPlayable,
+            releaseDate:      song.releaseDate,
+            genres:           song.genres
         )
     }
 

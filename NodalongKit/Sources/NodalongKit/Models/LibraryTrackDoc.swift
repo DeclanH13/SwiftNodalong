@@ -13,6 +13,13 @@ public struct LibraryTrackDoc: Codable, Identifiable, Hashable, Sendable {
     public var duration: Int?
     public var trackNumber: Int?
     public var albumReleaseDate: String?
+    /// Overlaid from the shared catalog on read — never stored on the slim
+    /// library doc itself. Empty means the catalog row has no genre yet.
+    public var genres: [String]
+    /// Overlaid from the shared catalog row — see `merged(withCatalog:)`.
+    /// `false` can mean "not explicit" OR "not captured yet"; an album-level
+    /// mark treats both the same way, so it fills in as rows re-sync.
+    public var isExplicit: Bool
     public let savedAt: Double
 
     public var id: String { catalogId }
@@ -29,6 +36,8 @@ public struct LibraryTrackDoc: Codable, Identifiable, Hashable, Sendable {
         duration: Int? = nil,
         trackNumber: Int? = nil,
         albumReleaseDate: String? = nil,
+        genres: [String] = [],
+        isExplicit: Bool = false,
         savedAt: Double
     ) {
         self.catalogId = catalogId
@@ -42,12 +51,14 @@ public struct LibraryTrackDoc: Codable, Identifiable, Hashable, Sendable {
         self.duration = duration
         self.trackNumber = trackNumber
         self.albumReleaseDate = albumReleaseDate
+        self.genres = genres
+        self.isExplicit = isExplicit
         self.savedAt = savedAt
     }
 
     private enum CodingKeys: String, CodingKey {
         case catalogId, title, artist, album, artwork, uri, sourceService
-        case isrc, duration, trackNumber, albumReleaseDate, savedAt
+        case isrc, duration, trackNumber, albumReleaseDate, savedAt, genres, isExplicit
     }
 
     // Tolerant decode: slim event docs carry only catalogId/sourceService/
@@ -65,6 +76,8 @@ public struct LibraryTrackDoc: Codable, Identifiable, Hashable, Sendable {
         duration         = try c.decodeIfPresent(Int.self, forKey: .duration)
         trackNumber      = try c.decodeIfPresent(Int.self, forKey: .trackNumber)
         albumReleaseDate = try c.decodeIfPresent(String.self, forKey: .albumReleaseDate)
+        genres = try c.decodeIfPresent([String].self, forKey: .genres) ?? []
+        isExplicit = try c.decodeIfPresent(Bool.self, forKey: .isExplicit) ?? false
         savedAt          = try c.decodeIfPresent(Double.self, forKey: .savedAt) ?? 0
     }
 
@@ -95,6 +108,8 @@ public struct LibraryTrackDoc: Codable, Identifiable, Hashable, Sendable {
         copy.duration         = catalog.duration ?? duration
         copy.trackNumber      = catalog.trackNumber ?? trackNumber
         copy.albumReleaseDate = catalog.albumReleaseDate ?? albumReleaseDate
+        copy.genres           = catalog.genres.isEmpty ? genres : catalog.genres
+        copy.isExplicit       = catalog.isExplicit
         return copy
     }
 }

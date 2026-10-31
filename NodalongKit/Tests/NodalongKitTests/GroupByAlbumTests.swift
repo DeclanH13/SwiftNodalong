@@ -8,7 +8,8 @@ final class GroupByAlbumTests: XCTestCase {
         title: String,
         artist: String,
         album: String,
-        trackNumber: Int? = nil
+        trackNumber: Int? = nil,
+        isExplicit: Bool = false
     ) -> LibraryTrackDoc {
         LibraryTrackDoc(
             catalogId: catalogId,
@@ -19,8 +20,41 @@ final class GroupByAlbumTests: XCTestCase {
             uri: catalogId,
             sourceService: .appleMusic,
             trackNumber: trackNumber,
+            isExplicit: isExplicit,
             savedAt: 0
         )
+    }
+
+    // MARK: - Album-level explicit
+
+    // An album is marked explicit if ANY of its tracks is — the convention
+    // music apps use.
+    func testAlbumIsExplicitWhenAnyTrackIs() {
+        let groups = groupByAlbum([
+            track(catalogId: "1", title: "A", artist: "X", album: "LP", trackNumber: 1),
+            track(catalogId: "2", title: "B", artist: "X", album: "LP", trackNumber: 2, isExplicit: true),
+        ])
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertTrue(groups[0].isExplicit)
+    }
+
+    func testAlbumIsNotExplicitWhenNoTrackIs() {
+        let groups = groupByAlbum([
+            track(catalogId: "1", title: "A", artist: "X", album: "LP", trackNumber: 1),
+            track(catalogId: "2", title: "B", artist: "X", album: "LP", trackNumber: 2),
+        ])
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertFalse(groups[0].isExplicit)
+    }
+
+    // `false` for an unmarked album is load-bearing: the flag is captured at
+    // ingest and backfills incrementally, so "not captured yet" is common and
+    // must never read as explicit.
+    func testAlbumWithNoExplicitDataIsNotMarked() {
+        let groups = groupByAlbum([
+            track(catalogId: "1", title: "A", artist: "X", album: "LP")
+        ])
+        XCTAssertFalse(groups[0].isExplicit)
     }
 
     // A featured-artist track (e.g. "Jamie xx & Honey Dijon") must group with

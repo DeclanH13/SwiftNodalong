@@ -8,6 +8,15 @@ public struct AlbumGroup: Sendable, Hashable, Identifiable {
     public let albumReleaseDate: String?
     public let tracks: [LibraryTrackDoc]
 
+    /// `true` when ANY track on the album is explicit — the convention music
+    /// apps use for an album-level mark.
+    ///
+    /// Note `false` is ambiguous: it means "no explicit track" OR "explicit
+    /// data not captured yet" (see `CatalogTrack.isExplicit`). Treating both
+    /// the same way is deliberate — marking an album explicit on incomplete
+    /// data would be worse than marking it late.
+    public var isExplicit: Bool { tracks.contains(where: \.isExplicit) }
+
     public var id: String { key }
 }
 
@@ -23,7 +32,7 @@ public func groupByAlbum(_ tracks: [LibraryTrackDoc]) -> [AlbumGroup] {
         // EP"), which would otherwise split one album into two Shelf
         // groups. Lowercase + trim so case variants ("The Beatles" vs "the
         // beatles") merge into one group too.
-        let normalizedAlbum = stripSearchNoise(track.album).lowercased().trimmingCharacters(in: .whitespaces)
+        let normalizedAlbum = albumMatchKey(track.album)
         // The key is the ALBUM NAME ALONE — no artist component — once
         // there IS an album name. A various-artists compilation's tracks
         // are genuinely credited to different primary artists by design

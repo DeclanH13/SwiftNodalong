@@ -56,3 +56,13 @@ actor UserProfileCache {
     /// way the TTL shouldn't paper over.
     func invalidate() { cache.removeAll() }
 }
+
+/// Resolves a profile to push from a bare uid — through the shared profile
+/// cache rather than a fresh Firestore read — and starts warming that person's
+/// detail bundle at the same moment, so the fetch overlaps the push instead of
+/// following it.
+func profileForNavigation(uid: String, viewerUid: String?) async -> UserProfile? {
+    if let viewerUid { SocialCache.shared.prefetch(uid: uid, viewerUid: viewerUid) }
+    if let cached = await UserProfileCache.shared.profiles(uids: [uid]).first { return cached }
+    return try? await getUserProfile(uid: uid)
+}

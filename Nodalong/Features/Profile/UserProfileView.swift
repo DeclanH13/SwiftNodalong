@@ -13,6 +13,7 @@ struct UserProfileView: View {
     @EnvironmentObject private var musicService:   AppleMusicService
     @EnvironmentObject private var spotifyService: SpotifyMusicService
     @EnvironmentObject private var libraryVM:      LibraryViewModel
+    @EnvironmentObject private var homeVM:         HomeViewModel
 
     /// Whichever backend is actually connected — the play gate must check
     /// this, not hardcode Apple Music.
@@ -29,6 +30,23 @@ struct UserProfileView: View {
     /// Enriched copy of the passed-in `user.spotlightTracks` (which may be slim
     /// depending on where `user` came from). Populated in `loadData`.
     @State private var activeSpotlights: [SpotlightTrack] = []
+    @State private var match: TasteMatch?
+    @State private var genreMatch: GenreTasteMatch?
+    @State private var live: UserNowPlaying?
+    @State private var presence = UserPresenceService()
+
+    /// Seeds from the synchronous cache mirror so a warm (browse-prefetched)
+    /// profile is complete on its first frame instead of popping in.
+    init(user: UserProfile) {
+        self.user = user
+        if let b = SocialCache.peekBundle(uid: user.uid) {
+            _following        = State(initialValue: b.isFollowing)
+            _followerCount    = State(initialValue: b.followerCount)
+            _recentTracks     = State(initialValue: b.recentTracks)
+            _spotlightHistory = State(initialValue: b.spotlightHistory)
+            _playlists        = State(initialValue: b.playlists)
+        }
+    }
 
     private var isOwnProfile: Bool {
         authVM.currentUser?.uid == user.uid
@@ -44,9 +62,17 @@ struct UserProfileView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
             VStack(spacing: 24) {
                 avatarSection
+                if let live, live.isPlaying, !isOwnProfile {
+                    LiveNowCard(user: user, live: live).transition(.opacity.combined(with: .move(edge: .top)))
+                }
+                if (genreMatch != nil || match != nil), !isOwnProfile {
+                    TasteMatchCard(genre: genreMatch, fallback: match)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
                 spotlightSection
                 playlistsSection
                 recentTracksSection
@@ -56,13 +82,44 @@ struct UserProfileView: View {
             .padding(.top, 24)
             .padding(.bottom, 40)
         }
-        .background(Color.nodalong.bgBase)
-        .navigationTitle(user.username)
-        .navigationBarTitleDisplayMode(.inline)
+        }
+        .screenBackground()
+        .toolbar(.hidden, for: .navigationBar)
+        .screenControls()
         .navigationDestination(for: Playlist.self) { playlist in
             PlaylistDetailView(playlist: playlist)
         }
+        .animation(.easeOut(duration: 0.25), value: live?.catalogId)
+        .animation(.easeOut(duration: 0.25), value: match)
+        .animation(.easeOut(duration: 0.25), value: genreMatch)
+        .onAppear { recomputeMatch() }   // synchronous: warm data → card on frame one
         .task { await loadData() }
+        .task { presence.observeNowPlaying(uid: user.uid) { live = $0 } }
+        .onDisappear { presence.detachAll() }
+        .onChange(of: recentTracks) { _, _ in recomputeMatch() }
+        .onChange(of: spotlightHistory) { _, _ in recomputeMatch() }
+    }
+
+    /// Overlap between the viewer's listening and this person's, computed from
+    /// data both screens already hold — no extra reads.
+    private func recomputeMatch() {
+        guard !isOwnProfile else { match = nil; genreMatch = nil; return }
+        let mine = TasteProfile.from(library: libraryVM.tracks)
+            .merging(.from(posts: homeVM.recentPosts))
+            .merging(.from(spotlights: authVM.profile?.spotlightTracks ?? []))
+        let theirs = TasteProfile.from(posts: recentTracks)
+            .merging(.from(spotlights: spotlightHistory))
+        match = tasteMatch(mine: mine, theirs: theirs)
+
+        // Genre view of the same two histories. Friends' genres come from the
+        // catalog overlay, so it returns nil (→ artist fallback) until those
+        // rows have genres.
+        let mineTracks = libraryVM.tracks.map { GenreArtistTrack(artist: $0.artist, genres: $0.genres) }
+            + homeVM.recentPosts.map { GenreArtistTrack(artist: $0.artist, genres: $0.genres) }
+            + (authVM.profile?.spotlightTracks ?? []).map { GenreArtistTrack(artist: $0.artist, genres: $0.genres) }
+        let theirTracks = recentTracks.map { GenreArtistTrack(artist: $0.artist, genres: $0.genres) }
+            + spotlightHistory.map { GenreArtistTrack(artist: $0.artist, genres: $0.genres) }
+        genreMatch = genreTasteMatch(mine: mineTracks, theirs: theirTracks)
     }
 
     // MARK: - Spotlight
@@ -225,13 +282,20 @@ struct UserProfileView: View {
                     }
                     .padding(.horizontal, 2)
                 }
+                // Warm the first few playlists' tracks so opening one is
+                // instant. Billed reads, so capped inside `prefetch`.
+                .task(id: playlists.map(\.id)) {
+                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    guard !Task.isCancelled else { return }
+                    await PlaylistTracksCache.prefetch(playlists, viewerUid: authVM.currentUser?.uid)
+                }
             }
         }
     }
 
-    /// Other-user recent tracks — same paged carousel as own profile, but
-    /// with the spotlight callback disabled (`onSpotlight: nil`) so the
-    /// star button on each card doesn't appear.
+    /// Other-user recent tracks — the same paged carousel as own profile,
+    /// identical behaviour: spotlighting (any track, any user's) goes
+    /// through each row's own "…" menu.
     @ViewBuilder
     private var recentTracksSection: some View {
         if !recentTracks.isEmpty {
@@ -248,7 +312,6 @@ struct UserProfileView: View {
                         guard activeService.isAuthenticated else { return }
                         Task { await playerVM.play(.from(post: post)) }
                     },
-                    onSpotlight: nil,
                     onLike: { post in
                         guard let uid = authVM.currentUser?.uid else { return }
                         let doc = LibraryTrackDoc(

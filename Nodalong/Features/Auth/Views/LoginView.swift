@@ -14,6 +14,7 @@ struct LoginView: View {
     private enum Field { case email, password }
 
     var body: some View {
+        VStack(spacing: 0) {
         ScrollView {
             VStack(spacing: 24) {
                 VStack(spacing: 6) {
@@ -79,9 +80,12 @@ struct LoginView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 32)
         }
+        }
         .background(Color.nodalong.bgDeep.ignoresSafeArea())
-        .navigationTitle("Sign In")
-        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
+        // `textOnAccent`, not the default: these sit on `bgDeep`, where the
+        // default dark ink measures ~2:1 in light mode. See `screenControls`.
+        .screenControls(tint: Color.nodalong.textOnAccent)
         .onDisappear { authVM.authError = nil }
     }
 

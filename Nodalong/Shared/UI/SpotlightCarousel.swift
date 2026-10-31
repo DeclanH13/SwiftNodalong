@@ -10,11 +10,11 @@ struct SpotlightDay: Identifiable {
 
 /// Horizontally-paginated carousel of spotlight tracks, grouped by day.
 ///
-/// Used on `ProfileView` (own; with `onRemove` / `onPlay`) and
-/// `UserProfileView` (read-only). Each page is one `SpotlightDay`.
+/// Used on both `ProfileView` (own) and `UserProfileView` (another user's) —
+/// identical either way; each track's own "…" menu already offers
+/// Spotlight/Remove Spotlight, regardless of whose history this is.
 struct SpotlightCarousel: View {
     let days: [SpotlightDay]
-    var onRemove: ((String) -> Void)? = nil
     var onPlay:   ((SpotlightTrack) -> Void)? = nil
     var onAddToQueue: ((SpotlightTrack) -> Void)? = nil
 
@@ -22,11 +22,9 @@ struct SpotlightCarousel: View {
     @State private var displayedHeight: CGFloat
 
     init(days: [SpotlightDay],
-         onRemove: ((String) -> Void)? = nil,
          onPlay:   ((SpotlightTrack) -> Void)? = nil,
          onAddToQueue: ((SpotlightTrack) -> Void)? = nil) {
         self.days         = days
-        self.onRemove     = onRemove
         self.onPlay       = onPlay
         self.onAddToQueue = onAddToQueue
         let initialIndex = max(0, days.count - 1)
@@ -93,16 +91,17 @@ struct SpotlightCarousel: View {
                             // never renders more than `maxPageHeight` was
                             // pinned for, regardless of the underlying data.
                             ForEach(day.tracks.prefix(maxSpotlights), id: \.trackId) { track in
-                                // `onSpotlight` (un-spotlight) is routed into
-                                // the "..." menu, not a standalone icon —
-                                // `.row`'s icon column already holds heart +
-                                // add-to-queue + "...", and a 4th icon can't
-                                // fit at the 44pt-per-icon tap-target minimum
-                                // that sizes this card (see
-                                // `TrackCard.rowHeight`'s doc comment).
-                                // `TrackActionsMenuButton` already supports
-                                // this via its own `onSpotlight`/`isSpotlit`
-                                // params.
+                                // Un-spotlighting goes through the "…" menu
+                                // (`addToPlaylistSong`), not a standalone
+                                // icon — `.row`'s icon column already holds
+                                // heart + add-to-queue + "...", and a 4th
+                                // icon can't fit at the 44pt-per-icon
+                                // tap-target minimum that sizes this card
+                                // (see `TrackCard.rowHeight`'s doc comment).
+                                // Correct for a PAST day's track too: it
+                                // isn't in `todaySpotlitIds`, so the menu
+                                // offers "Spotlight" (re-pick as today's),
+                                // not a way to delete history.
                                 TrackCard(
                                     title:    track.title,
                                     artist:   track.artist,
@@ -111,15 +110,12 @@ struct SpotlightCarousel: View {
                                     layout:   .row,
                                     isSpotlit: true,
                                     onPlay:      onPlay.map { fn in { fn(track) } },
-                                    onSpotlight: day.isToday ? { onRemove?(track.trackId) } : nil,
                                     onAddToQueue: onAddToQueue.map { fn in { fn(track) } },
                                     addToPlaylistSong: .from(spotlight: track)
                                 )
                             }
                         }
-                        .padding(6)
-                        .background(Color.nodalong.bgBase)
-                        .clipShape(RoundedRectangle(cornerRadius: Corner.container, style: .continuous))
+                        .trackListContainer()
                         Spacer(minLength: 0)
                     }
                     .tag(i)
@@ -144,6 +140,8 @@ struct SpotlightCarousel: View {
             // bridging involved), so it — and the Recent Tracks section
             // below it — resize smoothly in lockstep.
             .id(days.count)
+            // Starts with its pages when Profile paints from cache — see `RemountOnAppear`.
+            .remountOnAppear()
             .tabViewStyle(.page(indexDisplayMode: .never))
             .frame(height: maxPageHeight)
             .frame(height: displayedHeight, alignment: .top)

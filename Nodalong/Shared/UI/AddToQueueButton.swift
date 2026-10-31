@@ -31,7 +31,7 @@ struct AddToQueueButton: View {
 
     var body: some View {
         Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            Haptics.impact(.light)
             if routeToParty, let song {
                 partyVM.addToQueue(song)
             } else {

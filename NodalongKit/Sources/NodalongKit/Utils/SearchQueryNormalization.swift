@@ -127,3 +127,21 @@ private func primaryArtistUncached(_ artist: String) -> String {
     return String(artist[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// The canonical "is this the same album?" key: `stripSearchNoise`, lowercased
+/// and trimmed.
+///
+/// 🔴 Exists so there is exactly ONE definition of album identity. It had been
+/// written out inline three times — `groupByAlbum`'s own grouping key, Home's
+/// New-Releases-vs-Shelf dedup, and Home's Recently-Played-vs-Jump-Back-In
+/// dedup — which is precisely the drift this codebase has already been bitten
+/// by: a dedup that silently stops matching the grouping it is meant to agree
+/// with. Change what "same album" means here and every caller follows.
+///
+/// Note two related keys deliberately do NOT route through this and are not
+/// bugs: `canonicalAlbumTitle` (AlbumEditionGrouping) strips *edition*
+/// wording — "Deluxe", "Remastered" — which is a different question, and the
+/// post-grouping keys in `GroupPostsByAlbum`/`FriendsActivity` omit the trim
+/// and are pinned by their own tests.
+public func albumMatchKey(_ albumName: String) -> String {
+    stripSearchNoise(albumName).lowercased().trimmingCharacters(in: .whitespaces)
+}
